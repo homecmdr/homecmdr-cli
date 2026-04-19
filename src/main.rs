@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod commands;
+mod workspace;
 
 #[derive(Parser)]
 #[command(
@@ -20,6 +21,8 @@ enum Commands {
         /// Name of the adapter to pull (e.g. adapter-elgato-lights)
         name: String,
     },
+    /// Rebuild the HomeCmdr workspace (runs cargo build)
+    Rebuild,
 }
 
 fn main() {
@@ -27,6 +30,7 @@ fn main() {
 
     let result = match cli.command {
         Commands::Pull { name } => commands::pull::run(&name),
+        Commands::Rebuild => commands::rebuild::run(),
     };
 
     if let Err(e) = result {

@@ -2,7 +2,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::fs;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use crate::workspace::find_workspace_root;
 
 const REGISTRY_URL: &str =
     "https://raw.githubusercontent.com/homecmdr/adapters/main/adapters.toml";
@@ -97,29 +99,11 @@ pub fn run(name: &str) -> Result<()> {
 
     println!();
     println!("{} added successfully.", entry.name);
-    println!("Run 'cargo build' to rebuild with the new adapter.");
+    println!("Rebuilding workspace...");
+    println!();
+    super::rebuild::run()?;
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Workspace detection
-// ---------------------------------------------------------------------------
-
-fn find_workspace_root() -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        let candidate = dir.join("Cargo.toml");
-        if candidate.exists() {
-            let content = fs::read_to_string(&candidate).ok()?;
-            if content.contains("[workspace]") {
-                return Some(dir);
-            }
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
