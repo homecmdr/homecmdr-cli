@@ -15,8 +15,11 @@ const API_ARCHIVE_URL: &str =
 // ---------------------------------------------------------------------------
 
 pub fn run(dir: Option<PathBuf>, force: bool) -> Result<()> {
-    // ── 1. Rust toolchain check ────────────────────────────────────────────
-    check_cargo()?;
+    // ── 1. Rust toolchain check (informational only) ───────────────────────
+    // cargo is not required when using pre-built binaries, so we warn rather
+    // than fail.  Users without Rust can still run `homecmdr build --release`
+    // which will download the pre-built API binary automatically.
+    let has_cargo = check_cargo_soft();
 
     // ── 2. Workspace directory ─────────────────────────────────────────────
     let workspace_dir = match dir {
@@ -116,17 +119,25 @@ pub fn run(dir: Option<PathBuf>, force: bool) -> Result<()> {
     println!();
 
     // ── 9. Offer to build now ──────────────────────────────────────────────
-    let build_now = prompt_confirm("Build the debug binary now? (takes a few minutes)", true)?;
-    if build_now {
-        crate::commands::build::run_cargo_build(&workspace_dir, false)?;
-        println!();
-        println!("Build complete. Next steps:");
-        println!("  • Add plugins:    homecmdr plugin add <name>");
-        println!("  • Deploy:         homecmdr build --release && homecmdr service install");
+    if has_cargo {
+        let build_now = prompt_confirm("Build the debug binary now? (takes a few minutes)", true)?;
+        if build_now {
+            crate::commands::build::run_cargo_build(&workspace_dir, false)?;
+            println!();
+            println!("Build complete. Next steps:");
+            println!("  • Add plugins:    homecmdr plugin add <name>");
+            println!("  • Deploy:         homecmdr build --release && homecmdr service install");
+        } else {
+            println!("Skipping build. When ready, run:");
+            println!("  homecmdr build            # debug build (requires Rust)");
+            println!("  homecmdr build --release  # optimised + install to /usr/local/bin/");
+        }
     } else {
-        println!("Skipping build. When ready, run:");
-        println!("  homecmdr build            # debug build");
-        println!("  homecmdr build --release  # optimised + ready to deploy");
+        println!("Skipping build (Rust toolchain not found).");
+        println!("When ready to deploy, run:");
+        println!("  homecmdr build --release");
+        println!("  # Downloads a pre-built binary for this platform, or falls back to cargo");
+        println!("  # if you install Rust later from https://rustup.rs/");
     }
 
     println!();
@@ -145,20 +156,25 @@ fn default_workspace_dir() -> Result<PathBuf> {
     Ok(data_dir.join("homecmdr").join("workspace"))
 }
 
-fn check_cargo() -> Result<()> {
-    let output = std::process::Command::new("cargo")
-        .arg("--version")
-        .output();
-    match output {
+fn check_cargo_soft() -> bool {
+    match std::process::Command::new("cargo").arg("--version").output() {
         Ok(o) if o.status.success() => {
             let ver = String::from_utf8_lossy(&o.stdout);
-            println!("Found: {}", ver.trim());
-            Ok(())
+            println!("Found Rust toolchain: {}", ver.trim());
+            true
         }
-        _ => bail!(
-            "cargo not found on PATH.\n\
-             Install the Rust toolchain from https://rustup.rs/ and try again."
-        ),
+        _ => {
+            println!("note: Rust toolchain (cargo) not found on PATH.");
+            println!(
+                "      Pre-built binaries will be used when you run 'homecmdr build --release'."
+            );
+            println!(
+                "      Install Rust from https://rustup.rs/ if you want to build plugins \
+                 from source."
+            );
+            println!();
+            false
+        }
     }
 }
 

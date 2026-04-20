@@ -2,15 +2,31 @@
 
 The primary installation and management tool for [HomeCmdr](https://github.com/homecmdr/homecmdr-api) — a self-hosted home automation server.
 
-The CLI handles everything: downloading the API source, interactive configuration, adding plugins, compiling, and deploying under systemd. No manual workspace cloning or `Cargo.toml` editing required.
+The CLI handles everything: downloading the API source, interactive configuration, adding plugins, compiling or downloading a pre-built binary, and deploying under systemd. No manual workspace cloning or `Cargo.toml` editing required.
 
-## Prerequisites
+## Supported platforms
 
-- Rust toolchain (`cargo`) — install from [rustup.rs](https://rustup.rs/)
-- x86-64 Linux with systemd (for service deployment)
-- `sudo` access (only required at deploy time)
+Pre-built binaries are published for GitHub Releases on every tagged version:
+
+| Platform | Architecture |
+|---|---|
+| Linux x86-64 | Standard desktop / server |
+| Linux aarch64 | Raspberry Pi 4/5 (64-bit OS), Pi Zero 2W |
+| Linux armv7 | Raspberry Pi 2/3/4 (32-bit OS) |
+
+The Rust toolchain is **not required** for the pre-built path. It is only needed if you want to add plugins (which compile into the binary at build time) on a platform that doesn't have a pre-built binary.
 
 ## Installation
+
+### One-liner (no Rust required)
+
+```bash
+curl -sSf https://raw.githubusercontent.com/homecmdr/homecmdr-cli/main/install.sh | bash
+```
+
+Detects your architecture automatically and downloads the correct binary from GitHub Releases.
+
+### Via Cargo (Rust toolchain required)
 
 ```bash
 cargo install --git https://github.com/homecmdr/homecmdr-cli
@@ -26,7 +42,9 @@ homecmdr init
 homecmdr plugin add zigbee2mqtt
 homecmdr plugin add elgato-lights
 
-# 3. Compile an optimised binary and install to /usr/local/bin/
+# 3. Build an optimised binary and install to /usr/local/bin/
+#    Downloads a pre-built binary from GitHub Releases if available for your
+#    platform; falls back to compiling from source automatically.
 homecmdr build --release
 
 # 4. Create system user, install config, write systemd unit, start service
@@ -43,7 +61,8 @@ homecmdr service logs
 Downloads the `homecmdr-api` source into `~/.local/share/homecmdr/workspace/` (or
 a path of your choice), runs interactive prompts for timezone, location, bind
 address, and database backend (SQLite or PostgreSQL), generates a random master
-key, and writes `config/default.toml`. Offers to build the debug binary immediately.
+key, and writes `config/default.toml`. If the Rust toolchain is present, offers
+to build the debug binary immediately.
 
 ### `homecmdr plugin add <name>`
 
@@ -54,7 +73,8 @@ Adds an official plugin to the workspace:
 3. Patches `Cargo.toml`, `crates/adapters/Cargo.toml`, and `crates/adapters/src/lib.rs`
 4. Reads `plugin.toml` from the crate and interactively prompts for all config values
 5. Appends the completed `[adapters.<name>]` block to `config/default.toml`
-6. Rebuilds the debug binary
+6. Rebuilds from source (plugins are compiled into the binary at build time, so a
+   pre-built binary cannot be used here)
 
 Accepts either the short name (`zigbee2mqtt`) or the full name (`adapter-zigbee2mqtt`).
 
@@ -68,13 +88,21 @@ and rebuilds.
 
 Shows installed plugins and available plugins from the official registry.
 
-### `homecmdr build [--release]`
+### `homecmdr build [--release] [--from-source]`
 
 Builds the HomeCmdr binary inside the workspace.
 
-- Without `--release`: debug build at `target/debug/api`
-- With `--release`: optimised build, installs to `/usr/local/bin/homecmdr` (via sudo),
-  and restarts the systemd service if it is already running
+- Without `--release`: debug build at `target/debug/api` (always uses cargo)
+- With `--release`:
+  1. Checks GitHub Releases for a pre-built binary matching this platform
+  2. If found: downloads it directly — no Rust toolchain needed
+  3. If not found or download fails: falls back to `cargo build --release` automatically
+  4. Installs the result to `/usr/local/bin/homecmdr` (via sudo if needed)
+  5. Restarts the systemd service if it is already running
+
+Pass `--from-source` to skip the download check and always compile locally. This
+happens automatically when a plugin has just been added or removed, since plugins
+must be compiled into the binary.
 
 ### `homecmdr service install`
 
@@ -103,6 +131,10 @@ via the `inventory` crate and are linked into the binary at build time. The CLI
 automates all the workspace patching steps that would otherwise require manual
 `Cargo.toml` edits, and drives configuration through a `plugin.toml` manifest
 shipped with each plugin crate.
+
+For users without plugins (or with only the built-in ones), `homecmdr build --release`
+can download a pre-built binary that was compiled by CI for the current platform,
+skipping the need for a local Rust toolchain entirely.
 
 ## Writing a plugin
 

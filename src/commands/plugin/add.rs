@@ -221,12 +221,16 @@ pub fn run(name: &str) -> Result<()> {
     println!("Plugin '{}' installed.", short_name(&entry.name));
     println!();
 
-    // Rebuild — if the service is already deployed and running, do a full
-    // release build + binary install + service restart so the new plugin is
-    // live immediately.  Otherwise a debug build is sufficient.
+    // Rebuild — always from source because the workspace Cargo.toml was just
+    // patched with a new plugin crate.  A pre-built binary would not include
+    // the new plugin, so force_source = true.
+    //
+    // If the service is already running, do a full release build + binary
+    // install + service restart so the new plugin is live immediately.
+    // Otherwise a debug build is sufficient.
     if is_service_active() {
         println!("Service is running — performing release build, installing, and restarting...");
-        crate::commands::build::run(true)?;
+        crate::commands::build::run(true, true)?;
     } else {
         crate::commands::build::run_cargo_build(&workspace, false)?;
     }
