@@ -3,7 +3,7 @@ use std::fs;
 
 use crate::workspace::resolve_workspace_root;
 
-use super::add::{fetch_registry, AdapterEntry};
+use super::add::{fetch_registry, short_name, AdapterEntry};
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -12,10 +12,9 @@ use super::add::{fetch_registry, AdapterEntry};
 pub fn run() -> Result<()> {
     let workspace = resolve_workspace_root()?;
 
-    println!("Fetching adapter registry...");
+    println!("Fetching plugin registry...");
     let registry = fetch_registry()?;
 
-    // Determine which adapters are already installed in the workspace
     let workspace_toml = workspace.join("Cargo.toml");
     let workspace_contents = fs::read_to_string(&workspace_toml)
         .with_context(|| format!("failed to read {}", workspace_toml.display()))?;
@@ -33,31 +32,38 @@ pub fn run() -> Result<()> {
         .collect();
 
     println!();
-    println!("Installed adapters:");
+    println!("Installed plugins:");
     if installed.is_empty() {
         println!("  (none)");
     } else {
-        for a in &installed {
+        for p in &installed {
             println!(
                 "  [installed]  {}  v{}  — {}",
-                a.name, a.version, a.description
+                short_name(&p.name),
+                p.version,
+                p.description
             );
         }
     }
 
     println!();
-    println!("Available adapters:");
+    println!("Available plugins:");
     if available.is_empty() {
-        println!("  (all official adapters are installed)");
+        println!("  (all official plugins are installed)");
     } else {
-        for a in &available {
-            println!("  {}  v{}  — {}", a.name, a.version, a.description);
+        for p in &available {
+            println!(
+                "  {}  v{}  — {}",
+                short_name(&p.name),
+                p.version,
+                p.description
+            );
         }
     }
 
     println!();
-    println!("Add an adapter:    homecmdr adapter add <name>");
-    println!("Remove an adapter: homecmdr adapter remove <name>");
+    println!("Add a plugin:    homecmdr plugin add <name>");
+    println!("Remove a plugin: homecmdr plugin remove <name>");
 
     Ok(())
 }

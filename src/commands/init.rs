@@ -113,8 +113,8 @@ pub fn run(dir: Option<PathBuf>, force: bool) -> Result<()> {
         crate::commands::build::run_cargo_build(&workspace_dir, false)?;
         println!();
         println!("Build complete. Next steps:");
-        println!("  • Add adapters: homecmdr adapter add <name>");
-        println!("  • Deploy under systemd: homecmdr build --release && homecmdr service install");
+        println!("  • Add plugins:    homecmdr plugin add <name>");
+        println!("  • Deploy:         homecmdr build --release && homecmdr service install");
     } else {
         println!("Skipping build. When ready, run:");
         println!("  homecmdr build            # debug build");
@@ -122,6 +122,7 @@ pub fn run(dir: Option<PathBuf>, force: bool) -> Result<()> {
     }
 
     println!();
+    println!("Available plugins: homecmdr plugin list");
     println!("Workspace initialised successfully.");
     Ok(())
 }
@@ -335,8 +336,8 @@ watch = false
 [telemetry]
 enabled = false
 
-# ── Adapters ──────────────────────────────────────────────────────────────
-# Add adapters with: homecmdr adapter add <name>
+# ── Plugins ───────────────────────────────────────────────────────────────
+# Add plugins with: homecmdr plugin add <name>
 # Then enable them here by adding the appropriate [adapters.<name>] block.
 
 [adapters.open_meteo]

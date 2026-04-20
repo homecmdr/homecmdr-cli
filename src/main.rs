@@ -7,7 +7,7 @@ mod workspace;
 #[derive(Parser)]
 #[command(
     name = "homecmdr",
-    about = "HomeCmdr CLI — install, manage adapters, and deploy your HomeCmdr instance",
+    about = "HomeCmdr CLI — install, manage plugins, and deploy your HomeCmdr instance",
     version
 )]
 struct Cli {
@@ -32,10 +32,10 @@ enum Commands {
         force: bool,
     },
 
-    /// Manage installed adapters.
-    Adapter {
+    /// Manage installed plugins.
+    Plugin {
         #[command(subcommand)]
-        subcommand: AdapterCommands,
+        subcommand: PluginCommands,
     },
 
     /// Build the HomeCmdr binary.
@@ -51,32 +51,24 @@ enum Commands {
         #[command(subcommand)]
         subcommand: ServiceCommands,
     },
-
-    /// (Legacy) Pull an official adapter — use 'homecmdr adapter add' instead.
-    #[command(hide = true)]
-    Pull {
-        /// Name of the adapter to pull (e.g. adapter-elgato-lights)
-        name: String,
-    },
-
-    /// (Legacy) Rebuild the workspace — use 'homecmdr build' instead.
-    #[command(hide = true)]
-    Rebuild,
 }
 
 #[derive(Subcommand)]
-enum AdapterCommands {
-    /// Download an official adapter, patch the workspace, and rebuild.
+enum PluginCommands {
+    /// Download a plugin, patch the workspace, and rebuild.
+    ///
+    /// Accepts either the full name (adapter-elgato-lights) or the short
+    /// name without the 'adapter-' prefix (elgato-lights).
     Add {
-        /// Name of the adapter (e.g. adapter-elgato-lights)
+        /// Name of the plugin (e.g. elgato-lights or adapter-elgato-lights)
         name: String,
     },
-    /// Remove an installed adapter, unpatch the workspace, and rebuild.
+    /// Remove an installed plugin, unpatch the workspace, and rebuild.
     Remove {
-        /// Name of the adapter to remove
+        /// Name of the plugin to remove
         name: String,
     },
-    /// List available adapters and show which are installed.
+    /// List available plugins and show which are installed.
     List,
 }
 
@@ -103,10 +95,10 @@ fn main() {
 
     let result = match cli.command {
         Commands::Init { dir, force } => commands::init::run(dir, force),
-        Commands::Adapter { subcommand } => match subcommand {
-            AdapterCommands::Add { name } => commands::adapter::add::run(&name),
-            AdapterCommands::Remove { name } => commands::adapter::remove::run(&name),
-            AdapterCommands::List => commands::adapter::list::run(),
+        Commands::Plugin { subcommand } => match subcommand {
+            PluginCommands::Add { name } => commands::plugin::add::run(&name),
+            PluginCommands::Remove { name } => commands::plugin::remove::run(&name),
+            PluginCommands::List => commands::plugin::list::run(),
         },
         Commands::Build { release } => commands::build::run(release),
         Commands::Service { subcommand } => match subcommand {
@@ -118,9 +110,6 @@ fn main() {
             ServiceCommands::Status => commands::service::manage::status(),
             ServiceCommands::Logs => commands::service::manage::logs(),
         },
-        // Legacy aliases
-        Commands::Pull { name } => commands::adapter::add::run(&name),
-        Commands::Rebuild => commands::build::run(false),
     };
 
     if let Err(e) = result {

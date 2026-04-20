@@ -4,32 +4,35 @@ use std::path::Path;
 
 use crate::workspace::resolve_workspace_root;
 
+use super::add::{canonical_name, short_name};
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
 pub fn run(name: &str) -> Result<()> {
+    let canonical = canonical_name(name);
     let workspace = resolve_workspace_root()?;
     println!("Workspace: {}", workspace.display());
 
-    let dest = workspace.join("crates").join(name);
+    let dest = workspace.join("crates").join(&canonical);
     if !dest.exists() {
         bail!(
-            "adapter '{}' is not installed (no directory at {}).",
-            name,
+            "plugin '{}' is not installed (no directory at {}).",
+            short_name(&canonical),
             dest.display()
         );
     }
 
     // Unpatch workspace Cargo.toml
     let workspace_toml = workspace.join("Cargo.toml");
-    unpatch_workspace_toml(&workspace_toml, name)
+    unpatch_workspace_toml(&workspace_toml, &canonical)
         .context("failed to unpatch workspace Cargo.toml")?;
 
     // Unpatch crates/adapters/Cargo.toml
     let adapters_toml = workspace.join("crates").join("adapters").join("Cargo.toml");
     if adapters_toml.exists() {
-        unpatch_adapters_toml(&adapters_toml, name)
+        unpatch_adapters_toml(&adapters_toml, &canonical)
             .context("failed to unpatch crates/adapters/Cargo.toml")?;
     }
 
@@ -40,7 +43,7 @@ pub fn run(name: &str) -> Result<()> {
         .join("src")
         .join("lib.rs");
     if lib_rs.exists() {
-        unpatch_adapters_lib_rs(&lib_rs, name)
+        unpatch_adapters_lib_rs(&lib_rs, &canonical)
             .context("failed to unpatch crates/adapters/src/lib.rs")?;
     }
 
@@ -49,10 +52,12 @@ pub fn run(name: &str) -> Result<()> {
     println!("  Removed {}.", dest.display());
 
     println!();
-    println!("{} removed.", name);
+    println!("Plugin '{}' removed.", short_name(&canonical));
+
+    let config_key = short_name(&canonical).replace('-', "_");
     println!(
         "Remember to also remove the [adapters.{}] block from config/default.toml.",
-        name.replace("adapter-", "").replace('-', "_")
+        config_key
     );
     println!();
 
@@ -71,7 +76,6 @@ fn unpatch_workspace_toml(toml_path: &Path, adapter_name: &str) -> Result<()> {
     let member = format!("    \"crates/{}\",\n", adapter_name);
 
     if !content.contains(&member) {
-        // Try without leading spaces / trailing comma variants
         let member_bare = format!("\"crates/{}\"", adapter_name);
         if !content.contains(&member_bare) {
             println!(
@@ -109,7 +113,6 @@ fn unpatch_adapters_toml(toml_path: &Path, adapter_name: &str) -> Result<()> {
 fn unpatch_adapters_lib_rs(lib_rs_path: &Path, adapter_name: &str) -> Result<()> {
     let crate_name = adapter_name.replace('-', "_");
     let use_stmt = format!("use {} as _;\n", crate_name);
-    // Also handle without trailing newline
     let use_stmt_bare = format!("use {} as _;", crate_name);
 
     let content = fs::read_to_string(lib_rs_path)?;

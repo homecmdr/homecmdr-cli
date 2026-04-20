@@ -30,27 +30,53 @@ pub struct AdapterEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Name normalisation
+// ---------------------------------------------------------------------------
+
+/// Accept either the full registry name (`adapter-elgato-lights`) or the
+/// short form without the prefix (`elgato-lights`).  Always returns the
+/// canonical `adapter-*` name used in the registry and workspace.
+pub fn canonical_name(name: &str) -> String {
+    if name.starts_with("adapter-") {
+        name.to_string()
+    } else {
+        format!("adapter-{}", name)
+    }
+}
+
+/// The short display name shown to the user, with the `adapter-` prefix
+/// stripped for readability.
+pub fn short_name(name: &str) -> &str {
+    name.strip_prefix("adapter-").unwrap_or(name)
+}
+
+// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
 pub fn run(name: &str) -> Result<()> {
+    let canonical = canonical_name(name);
     let workspace = resolve_workspace_root()?;
     println!("Workspace: {}", workspace.display());
 
     // Fetch registry
-    println!("Fetching adapter registry...");
+    println!("Fetching plugin registry...");
     let registry = fetch_registry()?;
 
-    // Find the requested adapter
+    // Find the requested plugin
     let entry = registry
         .adapters
         .iter()
-        .find(|a| a.name == name)
+        .find(|a| a.name == canonical)
         .ok_or_else(|| {
-            let available: Vec<&str> = registry.adapters.iter().map(|a| a.name.as_str()).collect();
+            let available: Vec<String> = registry
+                .adapters
+                .iter()
+                .map(|a| short_name(&a.name).to_string())
+                .collect();
             anyhow!(
-                "adapter '{}' not found in official registry.\nAvailable adapters:\n{}",
-                name,
+                "plugin '{}' not found in official registry.\nAvailable plugins:\n{}",
+                short_name(&canonical),
                 available
                     .iter()
                     .map(|n| format!("  - {n}"))
@@ -62,18 +88,18 @@ pub fn run(name: &str) -> Result<()> {
     let dest = workspace.join("crates").join(&entry.name);
     if dest.exists() {
         bail!(
-            "'{}' already exists at {}.\nRemove it first with 'homecmdr adapter remove {}' if you want to reinstall.",
-            entry.name,
-            dest.display(),
-            entry.name,
+            "plugin '{}' is already installed.\n\
+             Run 'homecmdr plugin remove {}' first if you want to reinstall.",
+            short_name(&entry.name),
+            short_name(&entry.name),
         );
     }
 
-    // Download and extract adapter crate
+    // Download and extract plugin crate
     println!("Downloading {}  v{}...", entry.display_name, entry.version);
     let zip_bytes = fetch_archive()?;
     extract_adapter(&zip_bytes, &entry.path, &dest)
-        .context("failed to extract adapter from archive")?;
+        .context("failed to extract plugin from archive")?;
     println!("  Extracted to {}", dest.display());
 
     // Patch 1: workspace Cargo.toml
@@ -93,7 +119,7 @@ pub fn run(name: &str) -> Result<()> {
         );
     }
 
-    // Patch 3: crates/adapters/src/lib.rs  ← this was the missing step
+    // Patch 3: crates/adapters/src/lib.rs
     let lib_rs = workspace
         .join("crates")
         .join("adapters")
@@ -111,14 +137,17 @@ pub fn run(name: &str) -> Result<()> {
     }
 
     println!();
-    println!("{} added successfully.", entry.name);
+    println!("Plugin '{}' installed.", short_name(&entry.name));
     println!();
+
+    // Derive a likely config key from the adapter name, e.g. "elgato_lights"
+    let config_key = short_name(&entry.name).replace('-', "_");
     println!(
         "Next: add an [adapters.{}] block to config/default.toml.",
-        entry.name.replace("adapter-", "").replace('-', "_")
+        config_key
     );
     println!(
-        "      Refer to {}/README.md for config options.",
+        "      Refer to {}/README.md for the available options.",
         dest.display()
     );
     println!();
@@ -135,23 +164,23 @@ pub fn run(name: &str) -> Result<()> {
 
 pub fn fetch_registry() -> Result<Registry> {
     let body = reqwest::blocking::get(REGISTRY_URL)
-        .context("failed to fetch adapter registry")?
+        .context("failed to fetch plugin registry")?
         .error_for_status()
         .context("registry returned an error status")?
         .text()
         .context("failed to read registry response")?;
-    toml::from_str(&body).context("failed to parse adapter registry")
+    toml::from_str(&body).context("failed to parse plugin registry")
 }
 
 fn fetch_archive() -> Result<Vec<u8>> {
     let mut response = reqwest::blocking::get(ADAPTERS_ARCHIVE_URL)
-        .context("failed to download adapters archive")?
+        .context("failed to download plugin archive")?
         .error_for_status()
-        .context("adapters archive returned an error status")?;
+        .context("plugin archive returned an error status")?;
     let mut bytes = Vec::new();
     response
         .read_to_end(&mut bytes)
-        .context("failed to read adapters archive")?;
+        .context("failed to read plugin archive")?;
     Ok(bytes)
 }
 
@@ -197,8 +226,8 @@ fn extract_adapter(zip_bytes: &[u8], adapter_path: &str, dest: &Path) -> Result<
 
     if extracted == 0 {
         bail!(
-            "no files found for adapter path '{}' in the archive — \
-             check that the adapter name is correct",
+            "no files found for plugin path '{}' in the archive — \
+             check that the plugin name is correct",
             adapter_path
         );
     }
