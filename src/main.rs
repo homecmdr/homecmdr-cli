@@ -42,19 +42,8 @@ enum Commands {
     Build {
         /// Build an optimised release binary and install it to
         /// /usr/local/bin/homecmdr, then restart the service if running.
-        ///
-        /// By default a release build will attempt to download a pre-built
-        /// binary from GitHub Releases for this platform before invoking
-        /// cargo.  Use --from-source to skip the download and always build
-        /// locally (required when you have just added a plugin).
         #[arg(long)]
         release: bool,
-
-        /// Skip the pre-built binary download and always compile from source.
-        /// This is set automatically when a plugin has just been added or
-        /// removed; pass it manually if you need a fully custom local build.
-        #[arg(long)]
-        from_source: bool,
     },
 
     /// Manage the HomeCmdr systemd service.
@@ -111,7 +100,7 @@ fn main() {
             PluginCommands::Remove { name } => commands::plugin::remove::run(&name),
             PluginCommands::List => commands::plugin::list::run(),
         },
-        Commands::Build { release, from_source } => commands::build::run(release, from_source),
+        Commands::Build { release } => commands::build::run(release),
         Commands::Service { subcommand } => match subcommand {
             ServiceCommands::Install => commands::service::install::run(),
             ServiceCommands::Uninstall => commands::service::install::run_uninstall(),
