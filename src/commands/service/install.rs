@@ -202,49 +202,17 @@ fn install_config(workspace: &Path) -> Result<()> {
         );
     }
 
-    // Copy main config
-    let dest = format!("{}/default.toml", CONFIG_DIR);
-    sudo_copy(&workspace_config, &dest)?;
-    sudo_run(&["chmod", "640", &dest])?;
-    sudo_run(&["chown", "root:homecmdr", &dest])?;
-    println!("  Copied config to {}.", dest);
+    // Read from workspace (we always have read access here), patch paths
+    // in memory, then write the result directly to /etc via sudo tee.
+    // This avoids ever needing to read /etc/homecmdr/default.toml as root.
+    let raw = fs::read_to_string(&workspace_config).with_context(|| {
+        format!(
+            "failed to read workspace config at {}",
+            workspace_config.display()
+        )
+    })?;
 
-    // Copy Lua asset directories
-    for dir_name in &["scenes", "automations", "scripts"] {
-        let src = workspace.join("config").join(dir_name);
-        if src.exists() {
-            let dst = format!("{}/{}", CONFIG_DIR, dir_name);
-            sudo_run(&["cp", "-r", src.to_str().unwrap_or(""), &dst])?;
-            sudo_run(&["chown", "-R", "homecmdr:homecmdr", &dst])?;
-            println!("  Copied {} to {}.", dir_name, dst);
-        }
-    }
-
-    // Update directory paths in the installed config to use absolute paths
-    patch_installed_config(&format!("{}/default.toml", CONFIG_DIR))?;
-
-    Ok(())
-}
-
-/// After copying the config to /etc/homecmdr/, update the relative directory
-/// paths to absolute /etc/homecmdr/<dir> paths so the service finds them.
-fn patch_installed_config(config_path: &str) -> Result<()> {
-    // Read the installed config (need sudo-readable path — we own it at this point
-    // since we just copied it as root, but we might not be root yet in this process).
-    // Simplest approach: use sudo tee to write the patched content.
-    let content = match fs::read_to_string(config_path) {
-        Ok(c) => c,
-        Err(_) => {
-            // Can't read it without root — skip; user can edit manually
-            println!(
-                "  (could not read {} to update directory paths — update them manually if needed)",
-                config_path
-            );
-            return Ok(());
-        }
-    };
-
-    let patched = content
+    let patched = raw
         .replace(
             "directory = \"config/scenes\"",
             "directory = \"/etc/homecmdr/scenes\"",
@@ -258,13 +226,34 @@ fn patch_installed_config(config_path: &str) -> Result<()> {
             "directory = \"/etc/homecmdr/scripts\"",
         );
 
-    if patched == content {
-        return Ok(()); // nothing to change
+    let dest = format!("{}/default.toml", CONFIG_DIR);
+    write_via_sudo_tee(&patched, &dest).context("failed to write config to /etc/homecmdr/")?;
+    sudo_run(&["chmod", "640", &dest])?;
+    sudo_run(&["chown", "root:homecmdr", &dest])?;
+    println!("  Wrote config to {}.", dest);
+
+    // Copy Lua asset directories if they exist in the workspace; always
+    // ensure the target directories exist (service needs them even if empty).
+    for dir_name in &["scenes", "automations", "scripts"] {
+        let dst = format!("{}/{}", CONFIG_DIR, dir_name);
+        let src = workspace.join("config").join(dir_name);
+        if src.exists() {
+            sudo_run(&["cp", "-r", src.to_str().unwrap_or(""), &dst])?;
+            println!("  Copied {} to {}.", dir_name, dst);
+        } else {
+            sudo_run(&["mkdir", "-p", &dst])?;
+            println!("  Created empty {} directory at {}.", dir_name, dst);
+        }
+        sudo_run(&["chown", "-R", "homecmdr:homecmdr", &dst])?;
     }
 
-    // Write via sudo tee
+    Ok(())
+}
+
+/// Write `content` to `path` as root using `sudo tee`.
+fn write_via_sudo_tee(content: &str, path: &str) -> Result<()> {
     let mut child = Command::new("sudo")
-        .args(["tee", config_path])
+        .args(["tee", path])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .spawn()
@@ -273,39 +262,18 @@ fn patch_installed_config(config_path: &str) -> Result<()> {
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
         stdin
-            .write_all(patched.as_bytes())
-            .context("failed to write patched config")?;
+            .write_all(content.as_bytes())
+            .context("failed to pipe content to sudo tee")?;
     }
 
     let status = child.wait().context("failed to wait for sudo tee")?;
     if !status.success() {
-        bail!("failed to write updated config to {}", config_path);
+        bail!("sudo tee failed writing to {}", path);
     }
-
-    println!("  Updated directory paths in {}.", config_path);
     Ok(())
 }
 
 fn write_unit_file() -> Result<()> {
-    // Write via sudo tee
-    let mut child = Command::new("sudo")
-        .args(["tee", UNIT_PATH])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .context("failed to spawn sudo tee")?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin
-            .write_all(SERVICE_UNIT.as_bytes())
-            .context("failed to write unit file content")?;
-    }
-
-    let status = child.wait().context("failed to wait for sudo tee")?;
-    if !status.success() {
-        bail!("failed to write systemd unit to {}", UNIT_PATH);
-    }
-
-    Ok(())
+    write_via_sudo_tee(SERVICE_UNIT, UNIT_PATH)
+        .with_context(|| format!("failed to write systemd unit to {}", UNIT_PATH))
 }
