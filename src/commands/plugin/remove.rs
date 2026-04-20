@@ -1,10 +1,25 @@
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 
 use crate::workspace::resolve_workspace_root;
 
 use super::add::{canonical_name, short_name};
+
+// ---------------------------------------------------------------------------
+// Minimal plugin.toml types (only need the block name for removal)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PluginManifest {
+    config: PluginConfigMeta,
+}
+
+#[derive(Deserialize)]
+struct PluginConfigMeta {
+    block: String,
+}
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -23,6 +38,11 @@ pub fn run(name: &str) -> Result<()> {
             dest.display()
         );
     }
+
+    // Resolve the config block name from plugin.toml before we delete the
+    // directory.  Fall back to deriving it from the adapter name for plugins
+    // installed before the manifest requirement was introduced.
+    let block_name = read_block_name(&dest, &canonical);
 
     // Unpatch workspace Cargo.toml
     let workspace_toml = workspace.join("Cargo.toml");
@@ -47,23 +67,109 @@ pub fn run(name: &str) -> Result<()> {
             .context("failed to unpatch crates/adapters/src/lib.rs")?;
     }
 
+    // Remove the config block from config/default.toml
+    let config_path = workspace.join("config").join("default.toml");
+    remove_config_block(&config_path, &block_name)
+        .context("failed to remove plugin config block from config/default.toml")?;
+
     // Remove the crate directory
     fs::remove_dir_all(&dest).with_context(|| format!("failed to remove {}", dest.display()))?;
     println!("  Removed {}.", dest.display());
 
     println!();
     println!("Plugin '{}' removed.", short_name(&canonical));
-
-    let config_key = short_name(&canonical).replace('-', "_");
-    println!(
-        "Remember to also remove the [adapters.{}] block from config/default.toml.",
-        config_key
-    );
     println!();
 
     // Rebuild
     crate::commands::build::run_cargo_build(&workspace, false)?;
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Config block name resolution
+// ---------------------------------------------------------------------------
+
+/// Read the `config.block` value from `plugin.toml`.  If the file is absent
+/// or unreadable (e.g. plugin was installed before the manifest requirement),
+/// derive the block name from the adapter name instead.
+fn read_block_name(crate_dir: &Path, canonical: &str) -> String {
+    let manifest_path = crate_dir.join("plugin.toml");
+    if let Ok(src) = fs::read_to_string(&manifest_path) {
+        if let Ok(manifest) = toml::from_str::<PluginManifest>(&src) {
+            return manifest.config.block;
+        }
+    }
+    // Fallback: adapter-roku-tv → adapters.roku_tv
+    format!("adapters.{}", short_name(canonical).replace('-', "_"))
+}
+
+// ---------------------------------------------------------------------------
+// Config block removal
+// ---------------------------------------------------------------------------
+
+/// Remove the `[block_name]` section and all of its key-value lines from the
+/// config file.  Stops at the next TOML section header (`[`) or EOF.
+/// Cleans up surrounding blank lines so the file stays tidy.
+fn remove_config_block(config_path: &Path, block_name: &str) -> Result<()> {
+    if !config_path.exists() {
+        println!("  config/default.toml not found — skipping config cleanup.");
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+
+    let header = format!("[{}]", block_name);
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Find the section header line
+    let start = match lines.iter().position(|l| l.trim() == header) {
+        Some(i) => i,
+        None => {
+            println!(
+                "  [{}] block not found in config/default.toml — skipping.",
+                block_name
+            );
+            return Ok(());
+        }
+    };
+
+    // Find where the section ends: the next line that starts a new header, or EOF
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .map(|i| start + 1 + i)
+        .unwrap_or(lines.len());
+
+    // Build the result: everything before the section…
+    let mut result: Vec<&str> = lines[..start].to_vec();
+
+    // …strip any trailing blank lines that preceded the removed section…
+    while result
+        .last()
+        .map(|l: &&str| l.trim().is_empty())
+        .unwrap_or(false)
+    {
+        result.pop();
+    }
+
+    // …then, if there is content after the block, add one blank separator line
+    // and the remaining lines.
+    if end < lines.len() {
+        result.push("");
+        result.extend_from_slice(&lines[end..]);
+    }
+
+    let mut patched = result.join("\n");
+    if content.ends_with('\n') {
+        patched.push('\n');
+    }
+
+    fs::write(config_path, &patched)
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    println!("  Removed [{}] block from config/default.toml.", block_name);
     Ok(())
 }
 
