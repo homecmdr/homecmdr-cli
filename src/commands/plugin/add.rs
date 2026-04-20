@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::process::Command;
 
 use crate::workspace::resolve_workspace_root;
 
@@ -210,8 +211,15 @@ pub fn run(name: &str) -> Result<()> {
     println!("Plugin '{}' installed.", short_name(&entry.name));
     println!();
 
-    // Rebuild
-    crate::commands::build::run_cargo_build(&workspace, false)?;
+    // Rebuild — if the service is already deployed and running, do a full
+    // release build + binary install + service restart so the new plugin is
+    // live immediately.  Otherwise a debug build is sufficient.
+    if is_service_active() {
+        println!("Service is running — performing release build, installing, and restarting...");
+        crate::commands::build::run(true)?;
+    } else {
+        crate::commands::build::run_cargo_build(&workspace, false)?;
+    }
 
     Ok(())
 }
@@ -310,6 +318,20 @@ fn append_config_block(config_path: &Path, block: &str) -> Result<()> {
         .with_context(|| format!("failed to write to {}", config_path.display()))?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Service detection
+// ---------------------------------------------------------------------------
+
+/// Returns true if the homecmdr systemd service is currently active.
+/// Safe to call without sudo — `systemctl is-active` is a read-only query.
+fn is_service_active() -> bool {
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", "homecmdr"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
