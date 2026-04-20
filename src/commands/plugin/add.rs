@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 use crate::workspace::resolve_workspace_root;
@@ -27,6 +27,40 @@ pub struct AdapterEntry {
     pub display_name: String,
     pub description: String,
     pub version: String,
+}
+
+// ---------------------------------------------------------------------------
+// plugin.toml manifest types
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PluginManifest {
+    config: PluginConfig,
+}
+
+#[derive(Deserialize)]
+struct PluginConfig {
+    block: String,
+    fields: Vec<PluginField>,
+}
+
+#[derive(Deserialize)]
+struct PluginField {
+    key: String,
+    #[serde(rename = "type")]
+    field_type: String,
+    description: String,
+    /// Pre-filled default — user can press Enter to accept.
+    default: Option<String>,
+    /// Must be provided; no default allowed.
+    #[serde(default)]
+    required: bool,
+    /// May be left blank; key is omitted from the config block if empty.
+    #[serde(default)]
+    optional: bool,
+    /// Hint: value is sensitive (password). Stored plaintext for now.
+    #[serde(default)]
+    secret: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -136,24 +170,144 @@ pub fn run(name: &str) -> Result<()> {
         );
     }
 
+    // Read plugin.toml — required, hard fail if absent
+    let manifest_path = dest.join("plugin.toml");
+    if !manifest_path.exists() {
+        bail!(
+            "plugin '{}' is missing plugin.toml.\n\
+             This file is required for the CLI to configure the plugin.\n\
+             Please report this at https://github.com/homecmdr/adapters",
+            short_name(&entry.name)
+        );
+    }
+    let manifest_src = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let manifest: PluginManifest = toml::from_str(&manifest_src).with_context(|| {
+        format!(
+            "failed to parse plugin.toml for '{}'",
+            short_name(&entry.name)
+        )
+    })?;
+
+    // Prompt user for config values
+    println!();
+    println!(
+        "Configure {} — press Enter to accept defaults:",
+        entry.display_name
+    );
+    println!();
+    let config_block =
+        prompt_config_block(&manifest.config).context("failed to collect plugin configuration")?;
+
+    // Append the block to config/default.toml
+    let config_path = workspace.join("config").join("default.toml");
+    append_config_block(&config_path, &config_block)
+        .context("failed to write plugin config block to config/default.toml")?;
+    println!();
+    println!("  Config block written to config/default.toml.");
+
     println!();
     println!("Plugin '{}' installed.", short_name(&entry.name));
     println!();
 
-    // Derive a likely config key from the adapter name, e.g. "elgato_lights"
-    let config_key = short_name(&entry.name).replace('-', "_");
-    println!(
-        "Next: add an [adapters.{}] block to config/default.toml.",
-        config_key
-    );
-    println!(
-        "      Refer to {}/README.md for the available options.",
-        dest.display()
-    );
-    println!();
-
     // Rebuild
     crate::commands::build::run_cargo_build(&workspace, false)?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Config prompting
+// ---------------------------------------------------------------------------
+
+/// Walk every field in the manifest, prompt the user, and return a formatted
+/// TOML block string ready to append to config/default.toml.
+fn prompt_config_block(config: &PluginConfig) -> Result<String> {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("[{}]", config.block));
+
+    for field in &config.fields {
+        let value = prompt_field(field)?;
+        // Optional field that the user left blank — omit entirely.
+        if value.is_empty() {
+            continue;
+        }
+        let toml_line = format_toml_line(&field.key, &field.field_type, &value);
+        lines.push(toml_line);
+    }
+
+    lines.push(String::new()); // trailing newline after block
+    Ok(lines.join("\n"))
+}
+
+/// Prompt a single field.  Returns the raw string value entered by the user
+/// (already defaulted / validated).
+fn prompt_field(field: &PluginField) -> Result<String> {
+    let secret_hint = if field.secret { " (sensitive)" } else { "" };
+
+    loop {
+        if field.required {
+            print!("  {} [required{}]: ", field.description, secret_hint);
+        } else if let Some(ref default) = field.default {
+            print!("  {} [{}{}]: ", field.description, default, secret_hint);
+        } else {
+            // optional, no default
+            print!("  {} [optional{}]: ", field.description, secret_hint);
+        }
+
+        io::stdout().flush()?;
+        let mut buf = String::new();
+        io::stdin().read_line(&mut buf)?;
+        let trimmed = buf.trim().to_string();
+
+        if trimmed.is_empty() {
+            if let Some(ref default) = field.default {
+                return Ok(default.clone());
+            }
+            if field.optional {
+                return Ok(String::new()); // blank → omit from config
+            }
+            // required with no default and no input
+            println!("  This field is required — please enter a value.");
+            continue;
+        }
+
+        return Ok(trimmed);
+    }
+}
+
+/// Format a single TOML key = value line based on the declared type.
+fn format_toml_line(key: &str, field_type: &str, value: &str) -> String {
+    match field_type {
+        "bool" | "u64" | "i64" | "f64" => {
+            // Unquoted for numeric / boolean types
+            format!("{} = {}", key, value)
+        }
+        _ => {
+            // String and anything else — quoted
+            format!("{} = {:?}", key, value)
+        }
+    }
+}
+
+/// Append a formatted config block to the workspace config file.
+fn append_config_block(config_path: &Path, block: &str) -> Result<()> {
+    if !config_path.exists() {
+        bail!(
+            "config/default.toml not found at {}.\n\
+             Run 'homecmdr init' first.",
+            config_path.display()
+        );
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(config_path)
+        .with_context(|| format!("failed to open {} for appending", config_path.display()))?;
+
+    writeln!(file)?; // blank line separator before new block
+    file.write_all(block.as_bytes())
+        .with_context(|| format!("failed to write to {}", config_path.display()))?;
 
     Ok(())
 }
