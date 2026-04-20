@@ -15,8 +15,21 @@ pub fn run(release: bool) -> Result<()> {
     run_cargo_build(&workspace, release)?;
 
     if release {
+        // Stop the service before replacing the binary on disk — Linux refuses
+        // to overwrite an executable that is currently mapped into a running
+        // process ("Text file busy").
+        let was_active = service_is_active();
+        if was_active {
+            println!("Stopping service before installing binary...");
+            service_stop();
+        }
+
         install_binary(&workspace)?;
-        maybe_restart_service();
+
+        if was_active {
+            println!("Starting service...");
+            service_start();
+        }
     }
 
     Ok(())
@@ -110,28 +123,33 @@ fn install_binary(workspace: &Path) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Optional service restart
+// Service helpers
 // ---------------------------------------------------------------------------
 
-fn maybe_restart_service() {
-    // Check if the service is currently active; if so, offer to restart.
-    let is_active = Command::new("systemctl")
+fn service_is_active() -> bool {
+    Command::new("systemctl")
         .args(["is-active", "--quiet", "homecmdr"])
         .status()
         .map(|s| s.success())
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
 
-    if !is_active {
-        return;
-    }
-
-    println!("The homecmdr service is running. Restarting it to pick up the new binary...");
+fn service_stop() {
     let status = Command::new("sudo")
-        .args(["systemctl", "restart", "homecmdr"])
+        .args(["systemctl", "stop", "homecmdr"])
         .status();
-
     match status {
-        Ok(s) if s.success() => println!("Service restarted."),
-        _ => println!("Could not restart automatically. Run: sudo systemctl restart homecmdr"),
+        Ok(s) if s.success() => println!("  Service stopped."),
+        _ => println!("  warning: could not stop service automatically. Run: sudo systemctl stop homecmdr"),
+    }
+}
+
+fn service_start() {
+    let status = Command::new("sudo")
+        .args(["systemctl", "start", "homecmdr"])
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("  Service started."),
+        _ => println!("  warning: could not start service automatically. Run: sudo systemctl start homecmdr"),
     }
 }
