@@ -3,12 +3,12 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use crate::commands::config_sync::{sudo_run, write_via_sudo_tee, CONFIG_DIR};
 use crate::workspace::resolve_workspace_root;
 
 const SERVICE_NAME: &str = "homecmdr";
 const UNIT_PATH: &str = "/etc/systemd/system/homecmdr.service";
 const SYSTEM_BIN: &str = "/usr/local/bin/homecmdr";
-const CONFIG_DIR: &str = "/etc/homecmdr";
 const DATA_DIR: &str = "/var/lib/homecmdr";
 
 const SERVICE_UNIT: &str = r#"[Unit]
@@ -152,23 +152,6 @@ fn sudo_copy(src: &Path, dst: &str) -> Result<()> {
     sudo_run(&["cp", src.to_str().unwrap_or(""), dst])
 }
 
-fn sudo_run(args: &[&str]) -> Result<()> {
-    let (prog, prog_args) = args.split_first().expect("args must not be empty");
-    let mut cmd = Command::new("sudo");
-    cmd.arg(prog).args(prog_args);
-    let status = cmd
-        .status()
-        .with_context(|| format!("failed to run: sudo {}", args.join(" ")))?;
-    if !status.success() {
-        bail!(
-            "command failed (exit {}): sudo {}",
-            status.code().unwrap_or(-1),
-            args.join(" ")
-        );
-    }
-    Ok(())
-}
-
 fn create_system_user() -> Result<()> {
     // Check if user already exists
     let exists = Command::new("id")
@@ -194,43 +177,8 @@ fn create_system_user() -> Result<()> {
 }
 
 fn install_config(workspace: &Path) -> Result<()> {
-    let workspace_config = workspace.join("config").join("default.toml");
-    if !workspace_config.exists() {
-        bail!(
-            "workspace config not found at {}. Run 'homecmdr init' first.",
-            workspace_config.display()
-        );
-    }
-
-    // Read from workspace (we always have read access here), patch paths
-    // in memory, then write the result directly to /etc via sudo tee.
-    // This avoids ever needing to read /etc/homecmdr/default.toml as root.
-    let raw = fs::read_to_string(&workspace_config).with_context(|| {
-        format!(
-            "failed to read workspace config at {}",
-            workspace_config.display()
-        )
-    })?;
-
-    let patched = raw
-        .replace(
-            "directory = \"config/scenes\"",
-            "directory = \"/etc/homecmdr/scenes\"",
-        )
-        .replace(
-            "directory = \"config/automations\"",
-            "directory = \"/etc/homecmdr/automations\"",
-        )
-        .replace(
-            "directory = \"config/scripts\"",
-            "directory = \"/etc/homecmdr/scripts\"",
-        );
-
-    let dest = format!("{}/default.toml", CONFIG_DIR);
-    write_via_sudo_tee(&patched, &dest).context("failed to write config to /etc/homecmdr/")?;
-    sudo_run(&["chmod", "640", &dest])?;
-    sudo_run(&["chown", "root:homecmdr", &dest])?;
-    println!("  Wrote config to {}.", dest);
+    // Sync workspace config → /etc/homecmdr/default.toml via the shared helper.
+    crate::commands::config_sync::sync_workspace_config_to_system(workspace)?;
 
     // Copy Lua asset directories if they exist in the workspace; always
     // ensure the target directories exist (service needs them even if empty).
@@ -247,29 +195,6 @@ fn install_config(workspace: &Path) -> Result<()> {
         sudo_run(&["chown", "-R", "homecmdr:homecmdr", &dst])?;
     }
 
-    Ok(())
-}
-
-/// Write `content` to `path` as root using `sudo tee`.
-fn write_via_sudo_tee(content: &str, path: &str) -> Result<()> {
-    let mut child = Command::new("sudo")
-        .args(["tee", path])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .context("failed to spawn sudo tee")?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin
-            .write_all(content.as_bytes())
-            .context("failed to pipe content to sudo tee")?;
-    }
-
-    let status = child.wait().context("failed to wait for sudo tee")?;
-    if !status.success() {
-        bail!("sudo tee failed writing to {}", path);
-    }
     Ok(())
 }
 

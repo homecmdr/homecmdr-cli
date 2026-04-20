@@ -207,6 +207,16 @@ pub fn run(name: &str) -> Result<()> {
     println!();
     println!("  Config block written to config/default.toml.");
 
+    // If the service is installed, sync the updated workspace config to
+    // /etc/homecmdr/default.toml.  Without this step the service would
+    // restart with a new binary but the old config — and the new adapter
+    // block would never be read.
+    if std::path::Path::new(crate::commands::config_sync::SYSTEM_CONFIG).exists() {
+        println!("  Syncing config to system (/etc/homecmdr/default.toml)...");
+        crate::commands::config_sync::sync_workspace_config_to_system(&workspace)
+            .context("failed to sync config to /etc/homecmdr/default.toml")?;
+    }
+
     println!();
     println!("Plugin '{}' installed.", short_name(&entry.name));
     println!();
