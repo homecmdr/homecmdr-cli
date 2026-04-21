@@ -8,7 +8,7 @@ use crate::workspace::resolve_workspace_root;
 
 const SERVICE_NAME: &str = "homecmdr";
 const UNIT_PATH: &str = "/etc/systemd/system/homecmdr.service";
-const SYSTEM_BIN: &str = "/usr/local/bin/homecmdr";
+const SYSTEM_BIN: &str = "/usr/local/bin/homecmdr-server";
 const DATA_DIR: &str = "/var/lib/homecmdr";
 
 const SERVICE_UNIT: &str = r#"[Unit]
@@ -22,7 +22,7 @@ Type=simple
 User=homecmdr
 Group=homecmdr
 
-ExecStart=/usr/local/bin/homecmdr
+ExecStart=/usr/local/bin/homecmdr-server
 Restart=on-failure
 RestartSec=5s
 

@@ -78,7 +78,7 @@ pub fn run_cargo_build(workspace: &Path, release: bool) -> Result<()> {
 // Binary installation
 // ---------------------------------------------------------------------------
 
-const INSTALL_PATH: &str = "/usr/local/bin/homecmdr";
+const INSTALL_PATH: &str = "/usr/local/bin/homecmdr-server";
 
 fn install_binary(workspace: &Path) -> Result<()> {
     let src = workspace.join("target").join("release").join("api");
