@@ -103,5 +103,14 @@ fi
 echo ""
 echo "Installed: $("$INSTALL_DIR/$BIN_NAME" --version)"
 echo ""
+
+# Warn if a stale binary exists elsewhere on PATH that could shadow the new one
+EXISTING="$(command -v "$BIN_NAME" 2>/dev/null || true)"
+if [ -n "$EXISTING" ] && [ "$EXISTING" != "$INSTALL_DIR/$BIN_NAME" ]; then
+  echo "note: An older '$BIN_NAME' binary was found at: $EXISTING"
+  echo "      Run 'hash -r' or open a new terminal before using homecmdr."
+  echo ""
+fi
+
 echo "Get started:"
 echo "  homecmdr init"
