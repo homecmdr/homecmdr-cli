@@ -1,6 +1,6 @@
 [package]
 name = "homecmdr-cli"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "HomeCmdr CLI — install, manage adapters, and deploy your HomeCmdr instance"
 
