@@ -14,6 +14,10 @@ pub const REGISTRY_URL: &str =
 const PLUGINS_RAW_BASE: &str =
     "https://raw.githubusercontent.com/homecmdr/plugins/main";
 
+// Base URL for IPC binary downloads from GitHub Releases.
+const PLUGINS_RELEASES_BASE: &str =
+    "https://github.com/homecmdr/plugins/releases/download";
+
 // ---------------------------------------------------------------------------
 // Registry types (shared with list.rs)
 // ---------------------------------------------------------------------------
@@ -30,6 +34,23 @@ pub struct PluginEntry {
     pub display_name: String,
     pub description: String,
     pub version: String,
+    /// "wasm" (default) or "ipc".
+    #[serde(default = "default_wasm")]
+    pub adapter_type: String,
+    /// Binary filename stem for IPC plugins (e.g. "zigbee2mqtt-adapter").
+    /// Not present for WASM plugins.
+    #[serde(default)]
+    pub binary_name: Option<String>,
+}
+
+fn default_wasm() -> String {
+    "wasm".to_string()
+}
+
+impl PluginEntry {
+    pub fn is_ipc(&self) -> bool {
+        self.adapter_type == "ipc"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -37,12 +58,11 @@ pub struct PluginEntry {
 // ---------------------------------------------------------------------------
 
 /// The merged plugin manifest shipped with each plugin.
-/// The `[plugin]` and `[runtime]` sections are read by the WASM host.
+/// The `[plugin]` section is read by the host.
 /// The `[[config.fields]]` section is used only by the CLI for interactive
 /// config prompting; the host ignores it.
 #[derive(Deserialize)]
 pub struct PluginManifest {
-    #[allow(dead_code)]
     pub plugin: PluginMeta,
     #[serde(default)]
     pub config: CliConfig,
@@ -56,6 +76,12 @@ pub struct PluginMeta {
     pub description: String,
     #[serde(default)]
     pub version: String,
+    /// "wasm" (default) or "ipc".
+    #[serde(default = "default_wasm")]
+    pub adapter_type: String,
+    /// Binary filename for IPC adapters.  Defaults to `"{name}-adapter"`.
+    #[serde(default)]
+    pub binary: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -118,30 +144,31 @@ pub fn run(name: &str) -> Result<()> {
     let workspace = resolve_workspace_root()?;
     println!("Workspace: {}", workspace.display());
 
-    // Ensure plugins directory exists
+    // Ensure plugins directory exists.
     let plugins_dir = workspace.join("config").join("plugins");
     fs::create_dir_all(&plugins_dir)
         .with_context(|| format!("failed to create {}", plugins_dir.display()))?;
 
     let adapter = adapter_name(&canonical);
 
-    // Check if already installed (wasm file present)
-    let wasm_dest = plugins_dir.join(format!("{}.wasm", adapter));
-    if wasm_dest.exists() {
+    // Use the .plugin.toml manifest as the universal "already installed" marker
+    // for both WASM and IPC plugins.
+    let manifest_dest = plugins_dir.join(format!("{}.plugin.toml", adapter));
+    if manifest_dest.exists() {
         bail!(
             "plugin '{}' is already installed (found {}).\n\
              Run 'homecmdr plugin remove {}' first if you want to reinstall.",
             short_name(&canonical),
-            wasm_dest.display(),
+            manifest_dest.display(),
             short_name(&canonical),
         );
     }
 
-    // Fetch registry
+    // Fetch registry.
     println!("Fetching plugin registry...");
     let registry = fetch_registry()?;
 
-    // Find the requested plugin
+    // Find the requested plugin.
     let entry = registry
         .plugins
         .iter()
@@ -165,7 +192,7 @@ pub fn run(name: &str) -> Result<()> {
 
     println!("Downloading {}  v{}...", entry.display_name, entry.version);
 
-    // Download .plugin.toml manifest
+    // Download .plugin.toml manifest (needed for both WASM and IPC).
     let manifest_url = format!(
         "{PLUGINS_RAW_BASE}/{}/{}.plugin.toml",
         entry.path, adapter
@@ -175,31 +202,24 @@ pub fn run(name: &str) -> Result<()> {
     let manifest_str = String::from_utf8(manifest_bytes.clone())
         .context("manifest file is not valid UTF-8")?;
 
-    // Parse manifest for CLI config prompting
+    // Parse manifest for CLI config prompting.
     let manifest: PluginManifest = toml::from_str(&manifest_str)
         .with_context(|| format!("failed to parse manifest for '{}'", short_name(&canonical)))?;
 
-    // Download .wasm binary
-    let wasm_url = format!(
-        "{PLUGINS_RAW_BASE}/{}/{}.wasm",
-        entry.path, adapter
-    );
-    let wasm_bytes = download_bytes(&wasm_url)
-        .with_context(|| format!("failed to download WASM binary from {}", wasm_url))?;
+    // Download the plugin artifact (binary or .wasm) and write to plugins dir.
+    let binary_dest = if entry.is_ipc() {
+        install_ipc_binary(entry, &plugins_dir, &adapter)?
+    } else {
+        install_wasm(entry, &plugins_dir, &adapter)?
+    };
 
-    // Write files to config/plugins/
-    let manifest_dest = plugins_dir.join(format!("{}.plugin.toml", adapter));
+    // Write .plugin.toml.
     fs::write(&manifest_dest, &manifest_bytes)
         .with_context(|| format!("failed to write {}", manifest_dest.display()))?;
     println!("  Written: {}", manifest_dest.display());
 
-    fs::write(&wasm_dest, &wasm_bytes)
-        .with_context(|| format!("failed to write {}", wasm_dest.display()))?;
-    println!("  Written: {}", wasm_dest.display());
-
-    // Prompt user for config values (if [[config.fields]] section present)
+    // Prompt user for config values (if [[config.fields]] section present).
     let config_block = if manifest.config.fields.is_empty() {
-        // No interactive config needed — emit a minimal block
         format!("[adapters.{}]\nenabled = true\n", adapter)
     } else {
         println!();
@@ -212,46 +232,78 @@ pub fn run(name: &str) -> Result<()> {
             .context("failed to collect plugin configuration")?
     };
 
-    // Append the block to config/default.toml
+    // Append the block to config/default.toml.
     let config_path = workspace.join("config").join("default.toml");
     append_config_block(&config_path, &config_block)
         .context("failed to write plugin config block to config/default.toml")?;
     println!();
     println!("  Config block written to config/default.toml.");
 
-    // If the service is installed, sync the updated workspace config to
-    // /etc/homecmdr/default.toml AND copy the new plugin files so the server
-    // can actually find the factory.
+    // If the service is installed, sync the updated workspace config to the
+    // system directory and copy the new plugin files there too.
     if std::path::Path::new(crate::commands::config_sync::SYSTEM_CONFIG).exists() {
         println!("  Syncing config to system (/etc/homecmdr/default.toml)...");
         crate::commands::config_sync::sync_workspace_config_to_system(&workspace)
             .context("failed to sync config to /etc/homecmdr/default.toml")?;
 
-        // Copy the plugin files into the system plugin directory so the WASM
-        // factory loader can find them on the next (re)start.
         let system_plugins_dir = "/etc/homecmdr/plugins";
-        let system_wasm = format!("{}/{}.wasm", system_plugins_dir, adapter);
         let system_toml = format!("{}/{}.plugin.toml", system_plugins_dir, adapter);
         println!("  Copying plugin files to {}...", system_plugins_dir);
-        crate::commands::config_sync::sudo_run(&[
-            "cp",
-            wasm_dest.to_str().unwrap_or(""),
-            &system_wasm,
-        ])
-        .context("failed to copy .wasm to system plugin directory")?;
-        crate::commands::config_sync::sudo_run(&[
-            "cp",
-            manifest_dest.to_str().unwrap_or(""),
-            &system_toml,
-        ])
-        .context("failed to copy .plugin.toml to system plugin directory")?;
-        crate::commands::config_sync::sudo_run(&[
-            "chown",
-            "homecmdr:homecmdr",
-            &system_wasm,
-            &system_toml,
-        ])
-        .context("failed to set ownership on system plugin files")?;
+
+        if entry.is_ipc() {
+            // Copy the native binary and set ownership + executable bit.
+            let system_binary = format!(
+                "{}/{}",
+                system_plugins_dir,
+                binary_dest.file_name().unwrap_or_default().to_string_lossy()
+            );
+            crate::commands::config_sync::sudo_run(&[
+                "cp",
+                binary_dest.to_str().unwrap_or(""),
+                &system_binary,
+            ])
+            .context("failed to copy IPC binary to system plugin directory")?;
+            crate::commands::config_sync::sudo_run(&["chmod", "+x", &system_binary])
+                .context("failed to chmod IPC binary")?;
+            crate::commands::config_sync::sudo_run(&[
+                "cp",
+                manifest_dest.to_str().unwrap_or(""),
+                &system_toml,
+            ])
+            .context("failed to copy .plugin.toml to system plugin directory")?;
+            crate::commands::config_sync::sudo_run(&[
+                "chown",
+                "homecmdr:homecmdr",
+                &system_binary,
+                &system_toml,
+            ])
+            .context("failed to set ownership on system plugin files")?;
+        } else {
+            let system_wasm = format!(
+                "{}/{}",
+                system_plugins_dir,
+                binary_dest.file_name().unwrap_or_default().to_string_lossy()
+            );
+            crate::commands::config_sync::sudo_run(&[
+                "cp",
+                binary_dest.to_str().unwrap_or(""),
+                &system_wasm,
+            ])
+            .context("failed to copy .wasm to system plugin directory")?;
+            crate::commands::config_sync::sudo_run(&[
+                "cp",
+                manifest_dest.to_str().unwrap_or(""),
+                &system_toml,
+            ])
+            .context("failed to copy .plugin.toml to system plugin directory")?;
+            crate::commands::config_sync::sudo_run(&[
+                "chown",
+                "homecmdr:homecmdr",
+                &system_wasm,
+                &system_toml,
+            ])
+            .context("failed to set ownership on system plugin files")?;
+        }
     }
 
     println!();
@@ -267,6 +319,85 @@ pub fn run(name: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Download helpers for WASM and IPC
+// ---------------------------------------------------------------------------
+
+/// Download a WASM binary and write it to `plugins_dir/<adapter>.wasm`.
+/// Returns the path that was written.
+fn install_wasm(
+    entry: &PluginEntry,
+    plugins_dir: &Path,
+    adapter: &str,
+) -> Result<std::path::PathBuf> {
+    let wasm_url = format!(
+        "{PLUGINS_RAW_BASE}/{}/{}.wasm",
+        entry.path, adapter
+    );
+    let wasm_bytes = download_bytes(&wasm_url)
+        .with_context(|| format!("failed to download WASM binary from {}", wasm_url))?;
+
+    let dest = plugins_dir.join(format!("{}.wasm", adapter));
+    fs::write(&dest, &wasm_bytes)
+        .with_context(|| format!("failed to write {}", dest.display()))?;
+    println!("  Written: {}", dest.display());
+    Ok(dest)
+}
+
+/// Download an IPC native binary from GitHub Releases, write it to
+/// `plugins_dir/<binary_name>`, and set the executable bit.
+/// Returns the path that was written.
+fn install_ipc_binary(
+    entry: &PluginEntry,
+    plugins_dir: &Path,
+    adapter: &str,
+) -> Result<std::path::PathBuf> {
+    let binary_name = entry
+        .binary_name
+        .as_deref()
+        .unwrap_or_else(|| Box::leak(format!("{}-adapter", adapter).into_boxed_str()));
+
+    let arch = detect_arch()?;
+    let url = format!(
+        "{PLUGINS_RELEASES_BASE}/{name}-v{version}/{binary_name}-{arch}-linux",
+        name = entry.name,
+        version = entry.version,
+    );
+
+    println!("  Downloading binary for {arch}: {url}");
+    let bytes = download_bytes(&url)
+        .with_context(|| format!("failed to download IPC binary from {url}"))?;
+
+    let dest = plugins_dir.join(binary_name);
+    fs::write(&dest, &bytes)
+        .with_context(|| format!("failed to write {}", dest.display()))?;
+
+    // Set executable bit (Unix only).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&dest)?.permissions();
+        perms.set_mode(perms.mode() | 0o111);
+        fs::set_permissions(&dest, perms)
+            .with_context(|| format!("failed to chmod +x {}", dest.display()))?;
+    }
+
+    println!("  Written (executable): {}", dest.display());
+    Ok(dest)
+}
+
+/// Return the CPU architecture string used in release asset filenames.
+fn detect_arch() -> Result<&'static str> {
+    match std::env::consts::ARCH {
+        "x86_64" => Ok("x86_64"),
+        "aarch64" => Ok("aarch64"),
+        other => bail!(
+            "unsupported architecture '{other}' — \
+             download the adapter binary manually and place it in config/plugins/"
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
