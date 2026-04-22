@@ -35,7 +35,7 @@ pub struct PluginEntry {
     pub description: String,
     pub version: String,
     /// "wasm" (default) or "ipc".
-    #[serde(default = "default_wasm")]
+    #[serde(rename = "type", default = "default_wasm")]
     pub adapter_type: String,
     /// Binary filename stem for IPC plugins (e.g. "zigbee2mqtt-adapter").
     /// Not present for WASM plugins.
@@ -77,7 +77,7 @@ pub struct PluginMeta {
     #[serde(default)]
     pub version: String,
     /// "wasm" (default) or "ipc".
-    #[serde(default = "default_wasm")]
+    #[serde(rename = "type", default = "default_wasm")]
     pub adapter_type: String,
     /// Binary filename for IPC adapters.  Defaults to `"{name}-adapter"`.
     #[serde(default)]
