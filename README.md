@@ -2,15 +2,14 @@
 
 The primary installation and management tool for [HomeCmdr](https://github.com/homecmdr/homecmdr-api) — a self-hosted home automation server.
 
-The CLI handles everything: downloading the API source, interactive configuration, adding plugins, compiling, and deploying under systemd. No manual workspace cloning or `Cargo.toml` editing required.
+The CLI handles everything: downloading the server binary, interactive configuration, adding WASM plugins, and deploying under systemd. No Rust toolchain required.
 
 ## Prerequisites
 
-- Rust toolchain (`cargo`) — install from [rustup.rs](https://rustup.rs/)
 - Linux with systemd (for service deployment)
 - `sudo` access (only required at deploy time)
 
-HomeCmdr plugins are compile-time Rust crates linked into the API binary at build time, so a local Rust toolchain is required to build and customise the server.
+HomeCmdr plugins are pre-compiled WASM binaries. No Rust toolchain is needed to install or manage them.
 
 ## Installation
 
@@ -20,7 +19,7 @@ HomeCmdr plugins are compile-time Rust crates linked into the API binary at buil
 curl -sSf https://raw.githubusercontent.com/homecmdr/homecmdr-cli/main/install.sh | bash
 ```
 
-Detects your architecture automatically (x86-64, aarch64, armv7) and installs the `homecmdr` CLI binary. No Rust required for the CLI itself.
+Detects your architecture automatically (x86-64, aarch64, armv7) and installs the `homecmdr` CLI binary.
 
 ### Via Cargo
 
@@ -31,20 +30,17 @@ cargo install --git https://github.com/homecmdr/homecmdr-cli
 ## Quick start
 
 ```bash
-# 1. Download API source, generate config and master key
+# 1. Download server binary, generate config and master key
 homecmdr init
 
 # 2. Add plugins (interactive — prompts for each config value)
 homecmdr plugin add zigbee2mqtt
 homecmdr plugin add elgato-lights
 
-# 3. Compile an optimised binary and install to /usr/local/bin/
-homecmdr build --release
-
-# 4. Create system user, install config, write systemd unit, start service
+# 3. Create system user, install config, write systemd unit, start service
 homecmdr service install
 
-# 5. Check it started cleanly
+# 4. Check it started cleanly
 homecmdr service logs
 ```
 
@@ -52,52 +48,51 @@ homecmdr service logs
 
 ### `homecmdr init [--dir <path>] [--force]`
 
-Downloads the `homecmdr-api` source into `~/.local/share/homecmdr/workspace/` (or
-a path of your choice), runs interactive prompts for timezone, location, bind
-address, and database backend (SQLite or PostgreSQL), generates a random master
-key, and writes `config/default.toml`. Offers to build the debug binary immediately.
+Downloads the `homecmdr-server` binary for your architecture from the latest
+[homecmdr-api release](https://github.com/homecmdr/homecmdr-api/releases), runs
+interactive prompts for timezone, location, bind address, and database backend
+(SQLite or PostgreSQL), generates a random master key, and writes
+`config/default.toml` plus all required subdirectories.
+
+The workspace is created at `~/.local/share/homecmdr/workspace/` by default.
 
 ### `homecmdr plugin add <name>`
 
-Adds an official plugin to the workspace:
+Installs an official WASM plugin:
 
-1. Fetches the plugin registry from [homecmdr/adapters](https://github.com/homecmdr/adapters)
-2. Downloads and extracts the plugin crate into `crates/adapter-<name>/`
-3. Patches `Cargo.toml`, `crates/adapters/Cargo.toml`, and `crates/adapters/src/lib.rs`
-4. Reads `plugin.toml` from the crate and interactively prompts for all config values
-5. Appends the completed `[adapters.<name>]` block to `config/default.toml`
-6. Rebuilds the binary
+1. Fetches the plugin registry from [homecmdr/plugins](https://github.com/homecmdr/plugins)
+2. Downloads `<name>.wasm` and `<name>.plugin.toml` into `config/plugins/`
+3. Reads the `[[config.fields]]` section from the manifest and interactively
+   prompts for all config values
+4. Appends the completed `[adapters.<name>]` block to `config/default.toml`
+5. Restarts the service if it is already running (no recompile needed)
 
-Accepts either the short name (`zigbee2mqtt`) or the full name (`adapter-zigbee2mqtt`).
+Accepts either the short name (`zigbee2mqtt`) or the full name (`plugin-zigbee2mqtt`).
 
 ### `homecmdr plugin remove <name>`
 
-Reverses `plugin add`: unpatches all three workspace files, removes the
-`[adapters.<name>]` block from `config/default.toml`, deletes the crate directory,
-and rebuilds.
+Removes a plugin:
+
+1. Deletes `config/plugins/<name>.wasm` and `config/plugins/<name>.plugin.toml`
+2. Removes the `[adapters.<name>]` block from `config/default.toml`
+3. Restarts the service if running
 
 ### `homecmdr plugin list`
 
-Shows installed plugins and available plugins from the official registry.
-
-### `homecmdr build [--release]`
-
-Builds the HomeCmdr binary inside the workspace.
-
-- Without `--release`: debug build at `target/debug/api`
-- With `--release`: optimised build, installs to `/usr/local/bin/homecmdr` (via sudo),
-  and restarts the systemd service if it is already running
+Shows installed plugins (detected from `config/plugins/*.wasm`) and available
+plugins from the official registry.
 
 ### `homecmdr service install`
 
 Installs HomeCmdr as a systemd service:
 
-1. Creates the `homecmdr` system user
-2. Creates `/etc/homecmdr/` and `/var/lib/homecmdr/`
-3. Copies and patches `config/default.toml` (rewrites relative paths to absolute)
-4. Copies `config/scenes`, `config/automations`, and `config/scripts`
-5. Writes `/etc/systemd/system/homecmdr.service`
-6. Enables and starts the service
+1. Copies `homecmdr-server` to `/usr/local/bin/`
+2. Creates the `homecmdr` system user
+3. Creates `/etc/homecmdr/` and `/var/lib/homecmdr/`
+4. Copies and patches `config/default.toml` (rewrites relative paths to absolute)
+5. Copies `config/plugins`, `config/scenes`, `config/automations`, and `config/scripts`
+6. Writes `/etc/systemd/system/homecmdr.service`
+7. Enables and starts the service
 
 ### `homecmdr service uninstall`
 
@@ -108,48 +103,62 @@ preserved.
 
 Wrappers around `systemctl` and `journalctl -u homecmdr -f`.
 
-## How it works
+## How plugins work
 
-HomeCmdr plugins are compile-time Rust crates that self-register with the runtime
-via the `inventory` crate and are linked into the binary at build time. The CLI
-automates all the workspace patching steps that would otherwise require manual
-`Cargo.toml` edits, and drives configuration through a `plugin.toml` manifest
-shipped with each plugin crate.
+HomeCmdr plugins are pre-compiled WASM binaries (`*.wasm`). The server loads them
+at startup from `config/plugins/` using the wasmtime component model. Each plugin
+pairs with a `*.plugin.toml` manifest that declares its name and poll interval.
+
+Adding a plugin is three steps:
+
+1. Drop `<name>.wasm` + `<name>.plugin.toml` into `config/plugins/`
+2. Add `[adapters.<name>]` config block to `config/default.toml`
+3. Restart the server
+
+`homecmdr plugin add` automates all three steps.
 
 ## Writing a plugin
 
-Every plugin crate submitted to the official registry must include a `plugin.toml`
-manifest alongside its `Cargo.toml`. This file declares the config block name and
-each configuration field:
+Every plugin submitted to the official registry must include a merged
+`.plugin.toml` manifest. The `[plugin]` and `[runtime]` sections are read by
+the WASM host at runtime. The `[[config.fields]]` section is used only by the
+CLI for interactive config prompting — the host ignores it.
 
 ```toml
-[config]
-block = "adapters.my_plugin"
+[plugin]
+name        = "my_plugin"
+version     = "0.1.0"
+description = "My HomeCmdr plugin"
+api_version = "0.1.0"
 
+[runtime]
+poll_interval_secs = 60
+
+# CLI config prompting — ignored by the WASM host
 [[config.fields]]
-key = "enabled"
-type = "bool"
+key         = "enabled"
+type        = "bool"
 description = "Enable or disable this plugin"
-default = "true"
+default     = "true"
 
 [[config.fields]]
-key = "host"
-type = "string"
+key         = "host"
+type        = "string"
 description = "Hostname or IP address of the device"
-required = true
+required    = true
 
 [[config.fields]]
-key = "poll_interval_secs"
-type = "u64"
+key         = "poll_interval_secs"
+type        = "u64"
 description = "How often to poll for state changes (seconds)"
-default = "30"
+default     = "30"
 
 [[config.fields]]
-key = "password"
-type = "string"
+key         = "password"
+type        = "string"
 description = "Device password"
-optional = true
-secret = true
+optional    = true
+secret      = true
 ```
 
 Field attributes:
@@ -161,4 +170,5 @@ Field attributes:
 | `optional = true` | User may leave blank; key is omitted from the config block if empty |
 | `secret = true` | Marks the field as sensitive (stored plaintext) |
 
-The CLI hard-fails if `plugin.toml` is absent — there is no fallback.
+See [plugin_authoring_guide.md](https://github.com/homecmdr/homecmdr-api/blob/main/config/docs/plugin_authoring_guide.md)
+for the full guide on building a WASM plugin from scratch.

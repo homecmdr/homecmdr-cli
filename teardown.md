@@ -10,7 +10,7 @@ homecmdr service uninstall
 
 ```bash
 sudo rm -rf /etc/homecmdr /var/lib/homecmdr
-sudo rm -f /usr/local/bin/homecmdr
+sudo rm -f /usr/local/bin/homecmdr-server
 sudo userdel homecmdr
 ```
 
@@ -25,6 +25,8 @@ rm -rf ~/.config/homecmdr
 
 ```bash
 cargo uninstall homecmdr-cli
+# or, if installed via install.sh:
+sudo rm -f /usr/local/bin/homecmdr
 ```
 
 ---
@@ -33,6 +35,7 @@ cargo uninstall homecmdr-cli
 
 ```bash
 which homecmdr                          # should print nothing
+which homecmdr-server                   # should print nothing
 ls ~/.local/share/homecmdr 2>&1         # should say no such file
 ls ~/.config/homecmdr 2>&1              # should say no such file
 sudo ls /etc/homecmdr 2>&1              # should say no such file
@@ -42,6 +45,8 @@ id homecmdr 2>&1                        # should say no such user
 ## Fresh install flow
 
 ```bash
-cargo install --git https://github.com/homecmdr/homecmdr-cli
+curl -sSf https://raw.githubusercontent.com/homecmdr/homecmdr-cli/main/install.sh | bash
 homecmdr init
+homecmdr plugin add <name>
+homecmdr service install
 ```

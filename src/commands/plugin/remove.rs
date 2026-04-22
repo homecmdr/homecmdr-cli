@@ -1,25 +1,11 @@
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use crate::workspace::resolve_workspace_root;
 
-use super::add::{canonical_name, short_name};
-
-// ---------------------------------------------------------------------------
-// Minimal plugin.toml types (only need the block name for removal)
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct PluginManifest {
-    config: PluginConfigMeta,
-}
-
-#[derive(Deserialize)]
-struct PluginConfigMeta {
-    block: String,
-}
+use super::add::{adapter_name, canonical_name, short_name};
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -30,78 +16,62 @@ pub fn run(name: &str) -> Result<()> {
     let workspace = resolve_workspace_root()?;
     println!("Workspace: {}", workspace.display());
 
-    let dest = workspace.join("crates").join(&canonical);
-    if !dest.exists() {
+    let adapter = adapter_name(&canonical);
+    let plugins_dir = workspace.join("config").join("plugins");
+
+    let wasm_path = plugins_dir.join(format!("{}.wasm", adapter));
+    let manifest_path = plugins_dir.join(format!("{}.plugin.toml", adapter));
+
+    if !wasm_path.exists() && !manifest_path.exists() {
         bail!(
-            "plugin '{}' is not installed (no directory at {}).",
+            "plugin '{}' is not installed (no files found in {}).",
             short_name(&canonical),
-            dest.display()
+            plugins_dir.display(),
         );
     }
 
-    // Resolve the config block name from plugin.toml before we delete the
-    // directory.  Fall back to deriving it from the adapter name for plugins
-    // installed before the manifest requirement was introduced.
-    let block_name = read_block_name(&dest, &canonical);
-
-    // Unpatch workspace Cargo.toml
-    let workspace_toml = workspace.join("Cargo.toml");
-    unpatch_workspace_toml(&workspace_toml, &canonical)
-        .context("failed to unpatch workspace Cargo.toml")?;
-
-    // Unpatch crates/adapters/Cargo.toml
-    let adapters_toml = workspace.join("crates").join("adapters").join("Cargo.toml");
-    if adapters_toml.exists() {
-        unpatch_adapters_toml(&adapters_toml, &canonical)
-            .context("failed to unpatch crates/adapters/Cargo.toml")?;
+    // Remove .wasm binary
+    if wasm_path.exists() {
+        fs::remove_file(&wasm_path)
+            .with_context(|| format!("failed to remove {}", wasm_path.display()))?;
+        println!("  Removed {}.", wasm_path.display());
+    } else {
+        println!("  {} not found — skipping.", wasm_path.display());
     }
 
-    // Unpatch crates/adapters/src/lib.rs
-    let lib_rs = workspace
-        .join("crates")
-        .join("adapters")
-        .join("src")
-        .join("lib.rs");
-    if lib_rs.exists() {
-        unpatch_adapters_lib_rs(&lib_rs, &canonical)
-            .context("failed to unpatch crates/adapters/src/lib.rs")?;
+    // Remove .plugin.toml manifest
+    if manifest_path.exists() {
+        fs::remove_file(&manifest_path)
+            .with_context(|| format!("failed to remove {}", manifest_path.display()))?;
+        println!("  Removed {}.", manifest_path.display());
+    } else {
+        println!("  {} not found — skipping.", manifest_path.display());
     }
 
-    // Remove the config block from config/default.toml
+    // Remove [adapters.<name>] block from config/default.toml
     let config_path = workspace.join("config").join("default.toml");
+    let block_name = format!("adapters.{}", adapter);
     remove_config_block(&config_path, &block_name)
         .context("failed to remove plugin config block from config/default.toml")?;
 
-    // Remove the crate directory
-    fs::remove_dir_all(&dest).with_context(|| format!("failed to remove {}", dest.display()))?;
-    println!("  Removed {}.", dest.display());
+    // If the service is deployed, sync updated config and restart.
+    if std::path::Path::new(crate::commands::config_sync::SYSTEM_CONFIG).exists() {
+        println!("  Syncing config to system (/etc/homecmdr/default.toml)...");
+        crate::commands::config_sync::sync_workspace_config_to_system(&workspace)
+            .context("failed to sync config to /etc/homecmdr/default.toml")?;
+    }
 
     println!();
     println!("Plugin '{}' removed.", short_name(&canonical));
     println!();
 
-    // Rebuild
-    crate::commands::build::run_cargo_build(&workspace, false)?;
+    // Restart service if running — no rebuild needed.
+    if is_service_active() {
+        println!("Service is running — restarting to unload the plugin...");
+        restart_service();
+    }
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Config block name resolution
-// ---------------------------------------------------------------------------
-
-/// Read the `config.block` value from `plugin.toml`.  If the file is absent
-/// or unreadable (e.g. plugin was installed before the manifest requirement),
-/// derive the block name from the adapter name instead.
-fn read_block_name(crate_dir: &Path, canonical: &str) -> String {
-    let manifest_path = crate_dir.join("plugin.toml");
-    if let Ok(src) = fs::read_to_string(&manifest_path) {
-        if let Ok(manifest) = toml::from_str::<PluginManifest>(&src) {
-            return manifest.config.block;
-        }
-    }
-    // Fallback: adapter-roku-tv → adapters.roku_tv
-    format!("adapters.{}", short_name(canonical).replace('-', "_"))
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +93,6 @@ fn remove_config_block(config_path: &Path, block_name: &str) -> Result<()> {
     let header = format!("[{}]", block_name);
     let lines: Vec<&str> = content.lines().collect();
 
-    // Find the section header line
     let start = match lines.iter().position(|l| l.trim() == header) {
         Some(i) => i,
         None => {
@@ -142,10 +111,8 @@ fn remove_config_block(config_path: &Path, block_name: &str) -> Result<()> {
         .map(|i| start + 1 + i)
         .unwrap_or(lines.len());
 
-    // Build the result: everything before the section…
+    // Everything before the section, with trailing blank lines stripped
     let mut result: Vec<&str> = lines[..start].to_vec();
-
-    // …strip any trailing blank lines that preceded the removed section…
     while result
         .last()
         .map(|l: &&str| l.trim().is_empty())
@@ -154,8 +121,6 @@ fn remove_config_block(config_path: &Path, block_name: &str) -> Result<()> {
         result.pop();
     }
 
-    // …then, if there is content after the block, add one blank separator line
-    // and the remaining lines.
     if end < lines.len() {
         result.push("");
         result.extend_from_slice(&lines[end..]);
@@ -174,65 +139,26 @@ fn remove_config_block(config_path: &Path, block_name: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Unpatch helpers
+// Service helpers
 // ---------------------------------------------------------------------------
 
-fn unpatch_workspace_toml(toml_path: &Path, adapter_name: &str) -> Result<()> {
-    let content = fs::read_to_string(toml_path)?;
-    let member = format!("    \"crates/{}\",\n", adapter_name);
-
-    if !content.contains(&member) {
-        let member_bare = format!("\"crates/{}\"", adapter_name);
-        if !content.contains(&member_bare) {
-            println!(
-                "  {} not found in workspace Cargo.toml members — skipping.",
-                adapter_name
-            );
-            return Ok(());
-        }
-    }
-
-    let patched = content.replace(&member, "");
-    fs::write(toml_path, patched)?;
-    println!("  Unpatched workspace Cargo.toml.");
-    Ok(())
+fn is_service_active() -> bool {
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", "homecmdr"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
-fn unpatch_adapters_toml(toml_path: &Path, adapter_name: &str) -> Result<()> {
-    let content = fs::read_to_string(toml_path)?;
-    let dep_line = format!("{} = {{ path = \"../{}\" }}\n", adapter_name, adapter_name);
-
-    if !content.contains(&dep_line) {
-        println!(
-            "  {} not found in crates/adapters/Cargo.toml — skipping.",
-            adapter_name
-        );
-        return Ok(());
+fn restart_service() {
+    let status = Command::new("sudo")
+        .args(["systemctl", "restart", "homecmdr"])
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("  Service restarted."),
+        _ => println!(
+            "  warning: could not restart service automatically.\n\
+             Run: sudo systemctl restart homecmdr"
+        ),
     }
-
-    let patched = content.replace(&dep_line, "");
-    fs::write(toml_path, patched)?;
-    println!("  Unpatched crates/adapters/Cargo.toml.");
-    Ok(())
-}
-
-fn unpatch_adapters_lib_rs(lib_rs_path: &Path, adapter_name: &str) -> Result<()> {
-    let crate_name = adapter_name.replace('-', "_");
-    let use_stmt = format!("use {} as _;\n", crate_name);
-    let use_stmt_bare = format!("use {} as _;", crate_name);
-
-    let content = fs::read_to_string(lib_rs_path)?;
-
-    if !content.contains(&use_stmt_bare) {
-        println!(
-            "  {} not found in crates/adapters/src/lib.rs — skipping.",
-            adapter_name
-        );
-        return Ok(());
-    }
-
-    let patched = content.replace(&use_stmt, "").replace(&use_stmt_bare, "");
-    fs::write(lib_rs_path, patched)?;
-    println!("  Unpatched crates/adapters/src/lib.rs.");
-    Ok(())
 }

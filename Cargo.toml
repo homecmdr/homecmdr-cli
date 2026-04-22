@@ -1,8 +1,8 @@
 [package]
 name = "homecmdr-cli"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
-description = "HomeCmdr CLI — install, manage adapters, and deploy your HomeCmdr instance"
+description = "HomeCmdr CLI — install, manage WASM plugins, and deploy your HomeCmdr instance"
 
 [[bin]]
 name = "homecmdr"
@@ -16,4 +16,3 @@ rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-zip = "2"

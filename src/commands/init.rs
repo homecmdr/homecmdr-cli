@@ -4,21 +4,26 @@ use rand::Rng;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::workspace::{read_state, write_state, State};
 
-const API_ARCHIVE_URL: &str =
-    "https://github.com/homecmdr/homecmdr-api/archive/refs/heads/main.zip";
+// ---------------------------------------------------------------------------
+// Release download URLs
+//
+// NOTE: These point to GitHub Releases for homecmdr/homecmdr-api.
+// Release CI must publish binaries at these paths for the download to succeed.
+// Architecture detection mirrors the pattern used in install.sh for the CLI.
+// ---------------------------------------------------------------------------
+
+const API_REPO: &str = "homecmdr/homecmdr-api";
 
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
 pub fn run(dir: Option<PathBuf>, force: bool) -> Result<()> {
-    // ── 1. Rust toolchain check ────────────────────────────────────────────
-    check_cargo()?;
-
-    // ── 2. Workspace directory ─────────────────────────────────────────────
+    // ── 1. Workspace directory ─────────────────────────────────────────────
     let workspace_dir = match dir {
         Some(d) => d,
         None => default_workspace_dir()?,
@@ -33,15 +38,14 @@ pub fn run(dir: Option<PathBuf>, force: bool) -> Result<()> {
             fs::remove_dir_all(&workspace_dir)
                 .with_context(|| format!("failed to remove {}", workspace_dir.display()))?;
         } else {
-            // Check whether it looks like a previous init
             let existing_state = read_state();
             if existing_state.workspace_path.as_deref()
                 == Some(workspace_dir.to_str().unwrap_or(""))
             {
                 bail!(
                     "a HomeCmdr workspace already exists at {}.\n\
-                     Re-run with --force to overwrite, or run 'homecmdr adapter add <name>' \
-                     to add adapters.",
+                     Re-run with --force to overwrite, or run 'homecmdr plugin add <name>' \
+                     to add plugins.",
                     workspace_dir.display()
                 );
             }
@@ -56,23 +60,38 @@ pub fn run(dir: Option<PathBuf>, force: bool) -> Result<()> {
     println!("HomeCmdr workspace: {}", workspace_dir.display());
     println!();
 
-    // ── 3. Interactive configuration ───────────────────────────────────────
+    // ── 2. Interactive configuration ───────────────────────────────────────
     let timezone = prompt("Timezone", "UTC")?;
     let latitude = prompt("Latitude", "51.5")?;
     let longitude = prompt("Longitude", "-0.1")?;
     let bind_address = prompt("API bind address", "127.0.0.1:3001")?;
     let (db_backend, db_url) = prompt_database()?;
 
-    // ── 4. Generate master key ─────────────────────────────────────────────
+    // ── 3. Generate master key ─────────────────────────────────────────────
     let master_key = generate_key(32);
 
-    // ── 5. Download and extract homecmdr-api source ────────────────────────
+    // ── 4. Create workspace directory structure ────────────────────────────
     println!();
-    println!("Downloading HomeCmdr API source...");
-    let zip_bytes = download_archive()?;
+    println!("Creating workspace directories...");
+    for subdir in &[
+        "config/plugins",
+        "config/scenes",
+        "config/automations",
+        "config/scripts",
+    ] {
+        let path = workspace_dir.join(subdir);
+        fs::create_dir_all(&path)
+            .with_context(|| format!("failed to create {}", path.display()))?;
+    }
+    println!("  Created {}.", workspace_dir.display());
 
-    println!("Extracting to {}...", workspace_dir.display());
-    extract_api(&zip_bytes, &workspace_dir).context("failed to extract HomeCmdr API archive")?;
+    // ── 5. Download HomeCmdr server binary ─────────────────────────────────
+    println!();
+    println!("Downloading HomeCmdr server binary...");
+    let triple = detect_target_triple()?;
+    let server_bin = workspace_dir.join("homecmdr-server");
+    download_server_binary(&triple, &server_bin)?;
+    println!("  Downloaded to {}.", server_bin.display());
 
     // ── 6. Write generated config ──────────────────────────────────────────
     let config_path = workspace_dir.join("config").join("default.toml");
@@ -87,7 +106,7 @@ pub fn run(dir: Option<PathBuf>, force: bool) -> Result<()> {
     );
     fs::write(&config_path, &config_content)
         .with_context(|| format!("failed to write config to {}", config_path.display()))?;
-    println!("Wrote config to {}", config_path.display());
+    println!("Wrote config to {}.", config_path.display());
 
     // ── 7. Persist workspace state ─────────────────────────────────────────
     let state = State {
@@ -114,25 +133,116 @@ pub fn run(dir: Option<PathBuf>, force: bool) -> Result<()> {
     println!("  to override it without editing the config file.");
     println!("══════════════════════════════════════════════════════");
     println!();
+    println!("Workspace initialised successfully.");
+    println!();
+    println!("Next steps:");
+    println!("  • Add plugins:  homecmdr plugin add <name>");
+    println!("  • Deploy:       homecmdr service install");
+    println!("  • List plugins: homecmdr plugin list");
 
-    // ── 9. Offer to build now ──────────────────────────────────────────────
-    let build_now = prompt_confirm("Build the debug binary now? (takes a few minutes)", true)?;
-    if build_now {
-        crate::commands::build::run_cargo_build(&workspace_dir, false)?;
-        println!();
-        println!("Build complete. Next steps:");
-        println!("  • Add plugins:    homecmdr plugin add <name>");
-        println!("  • Deploy:         homecmdr build --release && homecmdr service install");
-    } else {
-        println!("Skipping build. When ready, run:");
-        println!("  homecmdr build            # debug build");
-        println!("  homecmdr build --release  # optimised + ready to deploy");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Architecture detection
+// ---------------------------------------------------------------------------
+
+fn detect_target_triple() -> Result<String> {
+    // uname -m on Linux
+    let output = Command::new("uname")
+        .arg("-m")
+        .output()
+        .context("failed to run 'uname -m'")?;
+
+    let arch = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_lowercase();
+
+    let triple = match arch.as_str() {
+        "x86_64" => "x86_64-unknown-linux-gnu",
+        "aarch64" | "arm64" => "aarch64-unknown-linux-gnu",
+        "armv7l" => "armv7-unknown-linux-gnueabihf",
+        other => bail!(
+            "unsupported architecture: {}.\n\
+             Please open an issue at https://github.com/homecmdr/homecmdr-cli",
+            other
+        ),
+    };
+
+    Ok(triple.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Server binary download
+// ---------------------------------------------------------------------------
+
+fn download_server_binary(triple: &str, dest: &Path) -> Result<()> {
+    // Fetch latest release tag from GitHub API
+    let tag = fetch_latest_tag(API_REPO)
+        .context("failed to determine the latest homecmdr-api release")?;
+
+    let url = format!(
+        "https://github.com/{API_REPO}/releases/download/{tag}/homecmdr-server-{triple}"
+    );
+
+    println!("  Release: {tag}");
+    println!("  URL: {url}");
+
+    let mut response = reqwest::blocking::get(&url)
+        .context("failed to download server binary")?
+        .error_for_status()
+        .with_context(|| {
+            format!(
+                "server binary download returned an error.\n\
+                 Check that release {tag} has a 'homecmdr-server-{triple}' asset at:\n  {url}"
+            )
+        })?;
+
+    let mut bytes = Vec::new();
+    response
+        .read_to_end(&mut bytes)
+        .context("failed to read server binary download")?;
+
+    fs::write(dest, &bytes)
+        .with_context(|| format!("failed to write binary to {}", dest.display()))?;
+
+    // Mark executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(dest)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(dest, perms)?;
     }
 
-    println!();
-    println!("Available plugins: homecmdr plugin list");
-    println!("Workspace initialised successfully.");
     Ok(())
+}
+
+fn fetch_latest_tag(repo: &str) -> Result<String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let body = reqwest::blocking::Client::new()
+        .get(&url)
+        .header("User-Agent", "homecmdr-cli")
+        .send()
+        .context("failed to query GitHub releases API")?
+        .error_for_status()
+        .context("GitHub releases API returned an error")?
+        .text()
+        .context("failed to read GitHub releases API response")?;
+
+    // Parse the tag_name field from the JSON response without pulling in
+    // a full JSON parser — the response shape is stable.
+    body.lines()
+        .find(|l| l.contains("\"tag_name\""))
+        .and_then(|l| {
+            let start = l.find('"').map(|i| i + 1)?;
+            let rest = &l[start..];
+            let start2 = rest.find('"').map(|i| i + 1)?;
+            let rest2 = &rest[start2..];
+            let end = rest2.find('"')?;
+            Some(rest2[..end].to_string())
+        })
+        .ok_or_else(|| anyhow::anyhow!("could not parse tag_name from GitHub releases response"))
 }
 
 // ---------------------------------------------------------------------------
@@ -145,23 +255,6 @@ fn default_workspace_dir() -> Result<PathBuf> {
     Ok(data_dir.join("homecmdr").join("workspace"))
 }
 
-fn check_cargo() -> Result<()> {
-    let output = std::process::Command::new("cargo")
-        .arg("--version")
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            let ver = String::from_utf8_lossy(&o.stdout);
-            println!("Found: {}", ver.trim());
-            Ok(())
-        }
-        _ => bail!(
-            "cargo not found on PATH.\n\
-             Install the Rust toolchain from https://rustup.rs/ and try again."
-        ),
-    }
-}
-
 fn generate_key(len: usize) -> String {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -170,8 +263,6 @@ fn generate_key(len: usize) -> String {
         .collect()
 }
 
-/// Ask whether to use SQLite (default) or PostgreSQL, collect connection
-/// details if needed, and return `(backend_string, database_url)`.
 fn prompt_database() -> Result<(String, String)> {
     println!();
     println!("Database backend:");
@@ -202,18 +293,13 @@ fn prompt_database() -> Result<(String, String)> {
             };
             Ok(("postgres".to_string(), url))
         }
-        _ => {
-            // sqlite (default)
-            Ok((
-                "sqlite".to_string(),
-                "sqlite://data/homecmdr.db".to_string(),
-            ))
-        }
+        _ => Ok((
+            "sqlite".to_string(),
+            "sqlite://data/homecmdr.db".to_string(),
+        )),
     }
 }
 
-/// Prompt for a value without echoing (password). Falls back to a plain
-/// prompt if rpassword is not available — stored plaintext either way.
 fn prompt_secret(label: &str) -> Result<String> {
     print!("{} (leave blank for none): ", label);
     io::stdout().flush()?;
@@ -222,7 +308,6 @@ fn prompt_secret(label: &str) -> Result<String> {
     Ok(buf.trim().to_string())
 }
 
-/// Simple line prompt with a default value.
 fn prompt(question: &str, default: &str) -> Result<String> {
     print!("  {} [{}]: ", question, default);
     io::stdout().flush()?;
@@ -234,85 +319,6 @@ fn prompt(question: &str, default: &str) -> Result<String> {
     } else {
         trimmed.to_string()
     })
-}
-
-/// Yes/no prompt.
-fn prompt_confirm(question: &str, default: bool) -> Result<bool> {
-    let hint = if default { "Y/n" } else { "y/N" };
-    print!("  {} [{}]: ", question, hint);
-    io::stdout().flush()?;
-    let mut buf = String::new();
-    io::stdin().read_line(&mut buf)?;
-    let answer = buf.trim().to_lowercase();
-    Ok(match answer.as_str() {
-        "y" | "yes" => true,
-        "n" | "no" => false,
-        "" => default,
-        _ => default,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Network
-// ---------------------------------------------------------------------------
-
-fn download_archive() -> Result<Vec<u8>> {
-    let mut response = reqwest::blocking::get(API_ARCHIVE_URL)
-        .context("failed to download HomeCmdr API archive")?
-        .error_for_status()
-        .context("archive download returned an error status")?;
-    let mut bytes = Vec::new();
-    response
-        .read_to_end(&mut bytes)
-        .context("failed to read archive response")?;
-    Ok(bytes)
-}
-
-// ---------------------------------------------------------------------------
-// Extraction
-// ---------------------------------------------------------------------------
-
-fn extract_api(zip_bytes: &[u8], dest: &Path) -> Result<()> {
-    let cursor = io::Cursor::new(zip_bytes);
-    let mut archive = zip::ZipArchive::new(cursor).context("failed to open zip archive")?;
-
-    // GitHub archives are prefixed with "<repo>-<branch>/", e.g. "homecmdr-api-main/"
-    let prefix = "homecmdr-api-main/";
-
-    let mut extracted = 0usize;
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let raw_name = file.name().to_string();
-
-        if !raw_name.starts_with(prefix) {
-            continue;
-        }
-
-        let relative = &raw_name[prefix.len()..];
-        if relative.is_empty() {
-            continue; // root directory entry
-        }
-
-        let out_path = dest.join(relative);
-
-        if raw_name.ends_with('/') {
-            fs::create_dir_all(&out_path)?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut content = Vec::new();
-            io::Read::read_to_end(&mut file, &mut content)?;
-            fs::write(&out_path, &content)?;
-            extracted += 1;
-        }
-    }
-
-    if extracted == 0 {
-        bail!("no files found in the archive — the download may have failed or the repository layout has changed");
-    }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +382,10 @@ retention_days = 30
 default_query_limit = 200
 max_query_limit = 1000
 
+[plugins]
+enabled = true
+directory = "config/plugins"
+
 [scenes]
 enabled = true
 directory = "config/scenes"
@@ -398,9 +408,9 @@ watch = false
 [telemetry]
 enabled = false
 
-# ── Plugins ───────────────────────────────────────────────────────────────
+# ── Adapters ─────────────────────────────────────────────────────────────────
 # Add plugins with: homecmdr plugin add <name>
-# Then enable them here by adding the appropriate [adapters.<name>] block.
+# Each plugin installed will append an [adapters.<name>] block here.
 
 [adapters.open_meteo]
 enabled = true

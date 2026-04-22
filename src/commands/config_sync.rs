@@ -14,6 +14,10 @@ pub const SYSTEM_CONFIG: &str = "/etc/homecmdr/default.toml";
 /// the config written to /etc/homecmdr/default.toml is self-contained.
 pub fn patch_config_paths(raw: &str) -> String {
     raw.replace(
+        "directory = \"config/plugins\"",
+        "directory = \"/etc/homecmdr/plugins\"",
+    )
+    .replace(
         "directory = \"config/scenes\"",
         "directory = \"/etc/homecmdr/scenes\"",
     )

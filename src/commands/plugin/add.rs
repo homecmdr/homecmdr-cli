@@ -1,16 +1,18 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
 
 use crate::workspace::resolve_workspace_root;
 
 pub const REGISTRY_URL: &str =
-    "https://raw.githubusercontent.com/homecmdr/adapters/main/adapters.toml";
-pub const ADAPTERS_ARCHIVE_URL: &str =
-    "https://github.com/homecmdr/adapters/archive/refs/heads/main.zip";
+    "https://raw.githubusercontent.com/homecmdr/plugins/main/plugins.toml";
+
+// Base URL for raw file downloads from the plugins repo.
+const PLUGINS_RAW_BASE: &str =
+    "https://raw.githubusercontent.com/homecmdr/plugins/main";
 
 // ---------------------------------------------------------------------------
 // Registry types (shared with list.rs)
@@ -18,11 +20,11 @@ pub const ADAPTERS_ARCHIVE_URL: &str =
 
 #[derive(Deserialize)]
 pub struct Registry {
-    pub adapters: Vec<AdapterEntry>,
+    pub plugins: Vec<PluginEntry>,
 }
 
-#[derive(Deserialize)]
-pub struct AdapterEntry {
+#[derive(Deserialize, Clone)]
+pub struct PluginEntry {
     pub name: String,
     pub path: String,
     pub display_name: String,
@@ -31,58 +33,80 @@ pub struct AdapterEntry {
 }
 
 // ---------------------------------------------------------------------------
-// plugin.toml manifest types
+// Merged .plugin.toml manifest types
 // ---------------------------------------------------------------------------
 
+/// The merged plugin manifest shipped with each plugin.
+/// The `[plugin]` and `[runtime]` sections are read by the WASM host.
+/// The `[[config.fields]]` section is used only by the CLI for interactive
+/// config prompting; the host ignores it.
 #[derive(Deserialize)]
-struct PluginManifest {
-    config: PluginConfig,
+pub struct PluginManifest {
+    #[allow(dead_code)]
+    pub plugin: PluginMeta,
+    #[serde(default)]
+    pub config: CliConfig,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+pub struct PluginMeta {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub version: String,
+}
+
+#[derive(Deserialize, Default)]
+pub struct CliConfig {
+    #[serde(default)]
+    pub fields: Vec<PluginField>,
 }
 
 #[derive(Deserialize)]
-struct PluginConfig {
-    block: String,
-    fields: Vec<PluginField>,
-}
-
-#[derive(Deserialize)]
-struct PluginField {
-    key: String,
+pub struct PluginField {
+    pub key: String,
     #[serde(rename = "type")]
-    field_type: String,
-    description: String,
+    pub field_type: String,
+    pub description: String,
     /// Pre-filled default — user can press Enter to accept.
-    default: Option<String>,
+    pub default: Option<String>,
     /// Must be provided; no default allowed.
     #[serde(default)]
-    required: bool,
+    pub required: bool,
     /// May be left blank; key is omitted from the config block if empty.
     #[serde(default)]
-    optional: bool,
+    pub optional: bool,
     /// Hint: value is sensitive (password). Stored plaintext for now.
     #[serde(default)]
-    secret: bool,
+    pub secret: bool,
 }
 
 // ---------------------------------------------------------------------------
 // Name normalisation
 // ---------------------------------------------------------------------------
 
-/// Accept either the full registry name (`adapter-elgato-lights`) or the
-/// short form without the prefix (`elgato-lights`).  Always returns the
-/// canonical `adapter-*` name used in the registry and workspace.
+/// Accept either the full registry name (`plugin-elgato-lights`) or the short
+/// form without the prefix (`elgato-lights`).  Always returns the canonical
+/// `plugin-*` name used in the registry.
 pub fn canonical_name(name: &str) -> String {
-    if name.starts_with("adapter-") {
+    if name.starts_with("plugin-") {
         name.to_string()
     } else {
-        format!("adapter-{}", name)
+        format!("plugin-{}", name)
     }
 }
 
-/// The short display name shown to the user, with the `adapter-` prefix
-/// stripped for readability.
+/// Short display name shown to the user, with the `plugin-` prefix stripped.
 pub fn short_name(name: &str) -> &str {
-    name.strip_prefix("adapter-").unwrap_or(name)
+    name.strip_prefix("plugin-").unwrap_or(name)
+}
+
+/// Convert a plugin name to the snake_case adapter name used in config keys
+/// and manifest `[plugin] name`.  e.g. "elgato-lights" → "elgato_lights".
+pub fn adapter_name(canonical: &str) -> String {
+    short_name(canonical).replace('-', "_")
 }
 
 // ---------------------------------------------------------------------------
@@ -94,20 +118,39 @@ pub fn run(name: &str) -> Result<()> {
     let workspace = resolve_workspace_root()?;
     println!("Workspace: {}", workspace.display());
 
+    // Ensure plugins directory exists
+    let plugins_dir = workspace.join("config").join("plugins");
+    fs::create_dir_all(&plugins_dir)
+        .with_context(|| format!("failed to create {}", plugins_dir.display()))?;
+
+    let adapter = adapter_name(&canonical);
+
+    // Check if already installed (wasm file present)
+    let wasm_dest = plugins_dir.join(format!("{}.wasm", adapter));
+    if wasm_dest.exists() {
+        bail!(
+            "plugin '{}' is already installed (found {}).\n\
+             Run 'homecmdr plugin remove {}' first if you want to reinstall.",
+            short_name(&canonical),
+            wasm_dest.display(),
+            short_name(&canonical),
+        );
+    }
+
     // Fetch registry
     println!("Fetching plugin registry...");
     let registry = fetch_registry()?;
 
     // Find the requested plugin
     let entry = registry
-        .adapters
+        .plugins
         .iter()
-        .find(|a| a.name == canonical)
+        .find(|p| p.name == canonical)
         .ok_or_else(|| {
             let available: Vec<String> = registry
-                .adapters
+                .plugins
                 .iter()
-                .map(|a| short_name(&a.name).to_string())
+                .map(|p| short_name(&p.name).to_string())
                 .collect();
             anyhow!(
                 "plugin '{}' not found in official registry.\nAvailable plugins:\n{}",
@@ -120,85 +163,54 @@ pub fn run(name: &str) -> Result<()> {
             )
         })?;
 
-    let dest = workspace.join("crates").join(&entry.name);
-    if dest.exists() {
-        bail!(
-            "plugin '{}' is already installed.\n\
-             Run 'homecmdr plugin remove {}' first if you want to reinstall.",
-            short_name(&entry.name),
-            short_name(&entry.name),
-        );
-    }
-
-    // Download and extract plugin crate
     println!("Downloading {}  v{}...", entry.display_name, entry.version);
-    let zip_bytes = fetch_archive()?;
-    extract_adapter(&zip_bytes, &entry.path, &dest)
-        .context("failed to extract plugin from archive")?;
-    println!("  Extracted to {}", dest.display());
 
-    // Patch 1: workspace Cargo.toml
-    let workspace_toml = workspace.join("Cargo.toml");
-    patch_workspace_toml(&workspace_toml, &entry.name)
-        .context("failed to patch workspace Cargo.toml")?;
-
-    // Patch 2: crates/adapters/Cargo.toml
-    let adapters_toml = workspace.join("crates").join("adapters").join("Cargo.toml");
-    if adapters_toml.exists() {
-        patch_adapters_toml(&adapters_toml, &entry.name)
-            .context("failed to patch crates/adapters/Cargo.toml")?;
-    } else {
-        eprintln!(
-            "warning: crates/adapters/Cargo.toml not found — skipping dependency patch. \
-             Add it manually."
-        );
-    }
-
-    // Patch 3: crates/adapters/src/lib.rs
-    let lib_rs = workspace
-        .join("crates")
-        .join("adapters")
-        .join("src")
-        .join("lib.rs");
-    if lib_rs.exists() {
-        patch_adapters_lib_rs(&lib_rs, &entry.name)
-            .context("failed to patch crates/adapters/src/lib.rs")?;
-    } else {
-        eprintln!(
-            "warning: crates/adapters/src/lib.rs not found — skipping factory registration. \
-             Add 'use {} as _;' manually.",
-            entry.name.replace('-', "_")
-        );
-    }
-
-    // Read plugin.toml — required, hard fail if absent
-    let manifest_path = dest.join("plugin.toml");
-    if !manifest_path.exists() {
-        bail!(
-            "plugin '{}' is missing plugin.toml.\n\
-             This file is required for the CLI to configure the plugin.\n\
-             Please report this at https://github.com/homecmdr/adapters",
-            short_name(&entry.name)
-        );
-    }
-    let manifest_src = fs::read_to_string(&manifest_path)
-        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-    let manifest: PluginManifest = toml::from_str(&manifest_src).with_context(|| {
-        format!(
-            "failed to parse plugin.toml for '{}'",
-            short_name(&entry.name)
-        )
-    })?;
-
-    // Prompt user for config values
-    println!();
-    println!(
-        "Configure {} — press Enter to accept defaults:",
-        entry.display_name
+    // Download .plugin.toml manifest
+    let manifest_url = format!(
+        "{PLUGINS_RAW_BASE}/{}/{}.plugin.toml",
+        entry.path, adapter
     );
-    println!();
-    let config_block =
-        prompt_config_block(&manifest.config).context("failed to collect plugin configuration")?;
+    let manifest_bytes = download_bytes(&manifest_url)
+        .with_context(|| format!("failed to download manifest from {}", manifest_url))?;
+    let manifest_str = String::from_utf8(manifest_bytes.clone())
+        .context("manifest file is not valid UTF-8")?;
+
+    // Parse manifest for CLI config prompting
+    let manifest: PluginManifest = toml::from_str(&manifest_str)
+        .with_context(|| format!("failed to parse manifest for '{}'", short_name(&canonical)))?;
+
+    // Download .wasm binary
+    let wasm_url = format!(
+        "{PLUGINS_RAW_BASE}/{}/{}.wasm",
+        entry.path, adapter
+    );
+    let wasm_bytes = download_bytes(&wasm_url)
+        .with_context(|| format!("failed to download WASM binary from {}", wasm_url))?;
+
+    // Write files to config/plugins/
+    let manifest_dest = plugins_dir.join(format!("{}.plugin.toml", adapter));
+    fs::write(&manifest_dest, &manifest_bytes)
+        .with_context(|| format!("failed to write {}", manifest_dest.display()))?;
+    println!("  Written: {}", manifest_dest.display());
+
+    fs::write(&wasm_dest, &wasm_bytes)
+        .with_context(|| format!("failed to write {}", wasm_dest.display()))?;
+    println!("  Written: {}", wasm_dest.display());
+
+    // Prompt user for config values (if [[config.fields]] section present)
+    let config_block = if manifest.config.fields.is_empty() {
+        // No interactive config needed — emit a minimal block
+        format!("[adapters.{}]\nenabled = true\n", adapter)
+    } else {
+        println!();
+        println!(
+            "Configure {} — press Enter to accept defaults:",
+            entry.display_name
+        );
+        println!();
+        prompt_config_block(&adapter, &manifest.config)
+            .context("failed to collect plugin configuration")?
+    };
 
     // Append the block to config/default.toml
     let config_path = workspace.join("config").join("default.toml");
@@ -208,9 +220,7 @@ pub fn run(name: &str) -> Result<()> {
     println!("  Config block written to config/default.toml.");
 
     // If the service is installed, sync the updated workspace config to
-    // /etc/homecmdr/default.toml.  Without this step the service would
-    // restart with a new binary but the old config — and the new adapter
-    // block would never be read.
+    // /etc/homecmdr/default.toml so the service picks it up on restart.
     if std::path::Path::new(crate::commands::config_sync::SYSTEM_CONFIG).exists() {
         println!("  Syncing config to system (/etc/homecmdr/default.toml)...");
         crate::commands::config_sync::sync_workspace_config_to_system(&workspace)
@@ -218,17 +228,15 @@ pub fn run(name: &str) -> Result<()> {
     }
 
     println!();
-    println!("Plugin '{}' installed.", short_name(&entry.name));
+    println!("Plugin '{}' installed.", short_name(&canonical));
     println!();
 
-    // Rebuild — if the service is already deployed and running, do a full
-    // release build + binary install + service restart so the new plugin is
-    // live immediately.  Otherwise a debug build is sufficient.
+    // Restart service if running — no rebuild needed.
     if is_service_active() {
-        println!("Service is running — performing release build, installing, and restarting...");
-        crate::commands::build::run(true)?;
+        println!("Service is running — restarting to load the new plugin...");
+        restart_service();
     } else {
-        crate::commands::build::run_cargo_build(&workspace, false)?;
+        println!("To activate: start the HomeCmdr service or run the server directly.");
     }
 
     Ok(())
@@ -238,15 +246,12 @@ pub fn run(name: &str) -> Result<()> {
 // Config prompting
 // ---------------------------------------------------------------------------
 
-/// Walk every field in the manifest, prompt the user, and return a formatted
-/// TOML block string ready to append to config/default.toml.
-fn prompt_config_block(config: &PluginConfig) -> Result<String> {
+fn prompt_config_block(adapter: &str, config: &CliConfig) -> Result<String> {
     let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("[{}]", config.block));
+    lines.push(format!("[adapters.{}]", adapter));
 
     for field in &config.fields {
         let value = prompt_field(field)?;
-        // Optional field that the user left blank — omit entirely.
         if value.is_empty() {
             continue;
         }
@@ -254,12 +259,10 @@ fn prompt_config_block(config: &PluginConfig) -> Result<String> {
         lines.push(toml_line);
     }
 
-    lines.push(String::new()); // trailing newline after block
+    lines.push(String::new());
     Ok(lines.join("\n"))
 }
 
-/// Prompt a single field.  Returns the raw string value entered by the user
-/// (already defaulted / validated).
 fn prompt_field(field: &PluginField) -> Result<String> {
     let secret_hint = if field.secret { " (sensitive)" } else { "" };
 
@@ -269,7 +272,6 @@ fn prompt_field(field: &PluginField) -> Result<String> {
         } else if let Some(ref default) = field.default {
             print!("  {} [{}{}]: ", field.description, default, secret_hint);
         } else {
-            // optional, no default
             print!("  {} [optional{}]: ", field.description, secret_hint);
         }
 
@@ -283,9 +285,8 @@ fn prompt_field(field: &PluginField) -> Result<String> {
                 return Ok(default.clone());
             }
             if field.optional {
-                return Ok(String::new()); // blank → omit from config
+                return Ok(String::new());
             }
-            // required with no default and no input
             println!("  This field is required — please enter a value.");
             continue;
         }
@@ -294,21 +295,13 @@ fn prompt_field(field: &PluginField) -> Result<String> {
     }
 }
 
-/// Format a single TOML key = value line based on the declared type.
 fn format_toml_line(key: &str, field_type: &str, value: &str) -> String {
     match field_type {
-        "bool" | "u64" | "i64" | "f64" => {
-            // Unquoted for numeric / boolean types
-            format!("{} = {}", key, value)
-        }
-        _ => {
-            // String and anything else — quoted
-            format!("{} = {:?}", key, value)
-        }
+        "bool" | "u64" | "i64" | "f64" => format!("{} = {}", key, value),
+        _ => format!("{} = {:?}", key, value),
     }
 }
 
-/// Append a formatted config block to the workspace config file.
 fn append_config_block(config_path: &Path, block: &str) -> Result<()> {
     if !config_path.exists() {
         bail!(
@@ -323,7 +316,7 @@ fn append_config_block(config_path: &Path, block: &str) -> Result<()> {
         .open(config_path)
         .with_context(|| format!("failed to open {} for appending", config_path.display()))?;
 
-    writeln!(file)?; // blank line separator before new block
+    writeln!(file)?;
     file.write_all(block.as_bytes())
         .with_context(|| format!("failed to write to {}", config_path.display()))?;
 
@@ -331,17 +324,28 @@ fn append_config_block(config_path: &Path, block: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Service detection
+// Service helpers
 // ---------------------------------------------------------------------------
 
-/// Returns true if the homecmdr systemd service is currently active.
-/// Safe to call without sudo — `systemctl is-active` is a read-only query.
 fn is_service_active() -> bool {
     Command::new("systemctl")
         .args(["is-active", "--quiet", "homecmdr"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+fn restart_service() {
+    let status = Command::new("sudo")
+        .args(["systemctl", "restart", "homecmdr"])
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("  Service restarted."),
+        _ => println!(
+            "  warning: could not restart service automatically.\n\
+             Run: sudo systemctl restart homecmdr"
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -358,142 +362,15 @@ pub fn fetch_registry() -> Result<Registry> {
     toml::from_str(&body).context("failed to parse plugin registry")
 }
 
-fn fetch_archive() -> Result<Vec<u8>> {
-    let mut response = reqwest::blocking::get(ADAPTERS_ARCHIVE_URL)
-        .context("failed to download plugin archive")?
+fn download_bytes(url: &str) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut response = reqwest::blocking::get(url)
+        .with_context(|| format!("request failed: {url}"))?
         .error_for_status()
-        .context("plugin archive returned an error status")?;
+        .with_context(|| format!("server returned error for: {url}"))?;
     let mut bytes = Vec::new();
     response
         .read_to_end(&mut bytes)
-        .context("failed to read plugin archive")?;
+        .with_context(|| format!("failed to read response body from: {url}"))?;
     Ok(bytes)
-}
-
-// ---------------------------------------------------------------------------
-// Extraction
-// ---------------------------------------------------------------------------
-
-fn extract_adapter(zip_bytes: &[u8], adapter_path: &str, dest: &Path) -> Result<()> {
-    let cursor = io::Cursor::new(zip_bytes);
-    let mut archive = zip::ZipArchive::new(cursor).context("failed to open zip archive")?;
-
-    // GitHub archives are prefixed with "<repo>-<branch>/", e.g. "adapters-main/"
-    let prefix = format!("adapters-main/{}/", adapter_path);
-
-    let mut extracted = 0usize;
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let raw_name = file.name().to_string();
-
-        if !raw_name.starts_with(&prefix) {
-            continue;
-        }
-
-        let relative = &raw_name[prefix.len()..];
-        if relative.is_empty() {
-            continue;
-        }
-
-        let out_path = dest.join(relative);
-
-        if raw_name.ends_with('/') {
-            fs::create_dir_all(&out_path)?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut content = Vec::new();
-            io::Read::read_to_end(&mut file, &mut content)?;
-            fs::write(&out_path, &content)?;
-            extracted += 1;
-        }
-    }
-
-    if extracted == 0 {
-        bail!(
-            "no files found for plugin path '{}' in the archive — \
-             check that the plugin name is correct",
-            adapter_path
-        );
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Cargo.toml patching
-// ---------------------------------------------------------------------------
-
-pub fn patch_workspace_toml(toml_path: &Path, adapter_name: &str) -> Result<()> {
-    let content = fs::read_to_string(toml_path)?;
-    let member = format!("\"crates/{}\"", adapter_name);
-
-    if content.contains(&member) {
-        println!(
-            "  {} already in workspace members — skipping.",
-            adapter_name
-        );
-        return Ok(());
-    }
-
-    let patched = content.replacen("]\nresolver", &format!("    {member},\n]\nresolver"), 1);
-
-    if patched == content {
-        bail!(
-            "could not patch workspace Cargo.toml — members array format not recognised. \
-             Add '{}' to [workspace] members manually.",
-            member
-        );
-    }
-
-    fs::write(toml_path, patched)?;
-    println!("  Patched workspace Cargo.toml.");
-    Ok(())
-}
-
-pub fn patch_adapters_toml(toml_path: &Path, adapter_name: &str) -> Result<()> {
-    let content = fs::read_to_string(toml_path)?;
-    let dep_key = format!("{} =", adapter_name);
-
-    if content.contains(&dep_key) {
-        println!(
-            "  {} already in crates/adapters/Cargo.toml — skipping.",
-            adapter_name
-        );
-        return Ok(());
-    }
-
-    let new_dep = format!("{} = {{ path = \"../{}\" }}\n", adapter_name, adapter_name);
-    let patched = if content.trim_end().ends_with('\n') {
-        format!("{}{}", content, new_dep)
-    } else {
-        format!("{}\n{}", content, new_dep)
-    };
-
-    fs::write(toml_path, patched)?;
-    println!("  Patched crates/adapters/Cargo.toml.");
-    Ok(())
-}
-
-/// Appends `use <crate_name> as _;` to `crates/adapters/src/lib.rs`.
-/// Crate name is the adapter name with hyphens replaced by underscores.
-pub fn patch_adapters_lib_rs(lib_rs_path: &Path, adapter_name: &str) -> Result<()> {
-    let crate_name = adapter_name.replace('-', "_");
-    let use_stmt = format!("use {} as _;", crate_name);
-
-    let content = fs::read_to_string(lib_rs_path)?;
-
-    if content.contains(&use_stmt) {
-        println!(
-            "  {} already in crates/adapters/src/lib.rs — skipping.",
-            adapter_name
-        );
-        return Ok(());
-    }
-
-    let patched = format!("{}\n{}\n", content.trim_end(), use_stmt);
-    fs::write(lib_rs_path, patched)?;
-    println!("  Patched crates/adapters/src/lib.rs.");
-    Ok(())
 }

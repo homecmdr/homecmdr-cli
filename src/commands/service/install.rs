@@ -54,12 +54,16 @@ pub fn run() -> Result<()> {
     // ── Preflight checks ──────────────────────────────────────────────────
     let workspace = resolve_workspace_root()?;
 
-    let release_bin = workspace.join("target").join("release").join("api");
-    if !release_bin.exists() {
+    // The server binary must already be present (placed there by `homecmdr init`
+    // or installed manually).
+    let workspace_bin = workspace.join("homecmdr-server");
+    if !workspace_bin.exists() && !Path::new(SYSTEM_BIN).exists() {
         bail!(
-            "release binary not found at {}.\n\
-             Run 'homecmdr build --release' first.",
-            release_bin.display()
+            "HomeCmdr server binary not found.\n\
+             Expected it at {} (workspace) or {} (system).\n\
+             Run 'homecmdr init' to download the server binary first.",
+            workspace_bin.display(),
+            SYSTEM_BIN,
         );
     }
 
@@ -75,9 +79,16 @@ pub fn run() -> Result<()> {
     println!("(Several steps require sudo — you may be prompted for your password.)");
     println!();
 
-    // ── 1. Install the release binary ─────────────────────────────────────
-    println!("Step 1/6: Installing binary to {}...", SYSTEM_BIN);
-    sudo_copy(&release_bin, SYSTEM_BIN)?;
+    // ── 1. Install the server binary ──────────────────────────────────────
+    if workspace_bin.exists() {
+        println!("Step 1/6: Installing binary to {}...", SYSTEM_BIN);
+        sudo_copy(&workspace_bin, SYSTEM_BIN)?;
+    } else {
+        println!(
+            "Step 1/6: Binary already present at {} — skipping copy.",
+            SYSTEM_BIN
+        );
+    }
 
     // ── 2. Create system user ─────────────────────────────────────────────
     println!("Step 2/6: Creating system user 'homecmdr'...");
@@ -115,11 +126,9 @@ pub fn run() -> Result<()> {
 pub fn run_uninstall() -> Result<()> {
     println!("Uninstalling HomeCmdr service...");
 
-    // Stop and disable
     let _ = sudo_run(&["systemctl", "stop", SERVICE_NAME]);
     let _ = sudo_run(&["systemctl", "disable", SERVICE_NAME]);
 
-    // Remove unit file
     if Path::new(UNIT_PATH).exists() {
         sudo_run(&["rm", "-f", UNIT_PATH])?;
         sudo_run(&["systemctl", "daemon-reload"])?;
@@ -143,7 +152,6 @@ pub fn run_uninstall() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn sudo_copy(src: &Path, dst: &str) -> Result<()> {
-    // Try direct first
     match fs::copy(src, dst) {
         Ok(_) => return Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
@@ -153,7 +161,6 @@ fn sudo_copy(src: &Path, dst: &str) -> Result<()> {
 }
 
 fn create_system_user() -> Result<()> {
-    // Check if user already exists
     let exists = Command::new("id")
         .arg("-u")
         .arg("homecmdr")
@@ -177,12 +184,12 @@ fn create_system_user() -> Result<()> {
 }
 
 fn install_config(workspace: &Path) -> Result<()> {
-    // Sync workspace config → /etc/homecmdr/default.toml via the shared helper.
+    // Sync workspace config → /etc/homecmdr/default.toml (patches directory paths).
     crate::commands::config_sync::sync_workspace_config_to_system(workspace)?;
 
-    // Copy Lua asset directories if they exist in the workspace; always
-    // ensure the target directories exist (service needs them even if empty).
-    for dir_name in &["scenes", "automations", "scripts"] {
+    // Copy asset directories.  `plugins` is included so pre-installed WASM
+    // plugins are available to the service without a separate copy step.
+    for dir_name in &["plugins", "scenes", "automations", "scripts"] {
         let dst = format!("{}/{}", CONFIG_DIR, dir_name);
         let src = workspace.join("config").join(dir_name);
         if src.exists() {

@@ -19,8 +19,8 @@ struct Cli {
 enum Commands {
     /// Bootstrap a new HomeCmdr workspace on this machine.
     ///
-    /// Downloads the HomeCmdr API source, generates a config with a secure
-    /// master key, and optionally builds the initial binary.
+    /// Downloads the HomeCmdr server binary, generates a config with a secure
+    /// master key, and creates the necessary directories.
     Init {
         /// Where to create the workspace directory.
         /// Defaults to ~/.local/share/homecmdr/workspace/
@@ -38,14 +38,6 @@ enum Commands {
         subcommand: PluginCommands,
     },
 
-    /// Build the HomeCmdr binary.
-    Build {
-        /// Build an optimised release binary and install it to
-        /// /usr/local/bin/homecmdr, then restart the service if running.
-        #[arg(long)]
-        release: bool,
-    },
-
     /// Manage the HomeCmdr systemd service.
     Service {
         #[command(subcommand)]
@@ -55,15 +47,15 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum PluginCommands {
-    /// Download a plugin, patch the workspace, and rebuild.
+    /// Download a plugin and install it into the workspace.
     ///
-    /// Accepts either the full name (adapter-elgato-lights) or the short
-    /// name without the 'adapter-' prefix (elgato-lights).
+    /// Accepts either the full name (plugin-elgato-lights) or the short
+    /// name without the 'plugin-' prefix (elgato-lights).
     Add {
-        /// Name of the plugin (e.g. elgato-lights or adapter-elgato-lights)
+        /// Name of the plugin (e.g. elgato-lights or plugin-elgato-lights)
         name: String,
     },
-    /// Remove an installed plugin, unpatch the workspace, and rebuild.
+    /// Remove an installed plugin from the workspace.
     Remove {
         /// Name of the plugin to remove
         name: String,
@@ -100,7 +92,6 @@ fn main() {
             PluginCommands::Remove { name } => commands::plugin::remove::run(&name),
             PluginCommands::List => commands::plugin::list::run(),
         },
-        Commands::Build { release } => commands::build::run(release),
         Commands::Service { subcommand } => match subcommand {
             ServiceCommands::Install => commands::service::install::run(),
             ServiceCommands::Uninstall => commands::service::install::run_uninstall(),
