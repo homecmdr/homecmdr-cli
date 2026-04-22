@@ -161,9 +161,9 @@ fn detect_target_triple() -> Result<String> {
     let triple = match arch.as_str() {
         "x86_64" => "x86_64-unknown-linux-gnu",
         "aarch64" | "arm64" => "aarch64-unknown-linux-gnu",
-        "armv7l" => "armv7-unknown-linux-gnueabihf",
         other => bail!(
             "unsupported architecture: {}.\n\
+             Supported: x86_64, aarch64 (Pi 4/5).\n\
              Please open an issue at https://github.com/homecmdr/homecmdr-cli",
             other
         ),
