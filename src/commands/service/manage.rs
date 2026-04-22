@@ -1,17 +1,45 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use std::path::Path;
 use std::process::Command;
 
 const SERVICE: &str = "homecmdr";
+const UNIT_PATH: &str = "/etc/systemd/system/homecmdr.service";
+const SYSTEM_BIN: &str = "/usr/local/bin/homecmdr-server";
+
+/// Verify that `homecmdr service install` has been run before trying to
+/// start/stop/restart the service.  Gives a clear, actionable error instead of
+/// a cryptic systemctl failure.
+fn require_installed() -> Result<()> {
+    if !Path::new(UNIT_PATH).exists() {
+        bail!(
+            "HomeCmdr service is not installed.\n\
+             Run 'homecmdr service install' first."
+        );
+    }
+    if !Path::new(SYSTEM_BIN).exists() {
+        bail!(
+            "Service unit exists at {} but the server binary is missing \
+             from {}.\n\
+             Run 'homecmdr service uninstall' then 'homecmdr service install' \
+             to repair the installation.",
+            UNIT_PATH, SYSTEM_BIN,
+        );
+    }
+    Ok(())
+}
 
 pub fn start() -> Result<()> {
+    require_installed()?;
     systemctl(&["start", SERVICE])
 }
 
 pub fn stop() -> Result<()> {
+    require_installed()?;
     systemctl(&["stop", SERVICE])
 }
 
 pub fn restart() -> Result<()> {
+    require_installed()?;
     systemctl(&["restart", SERVICE])
 }
 

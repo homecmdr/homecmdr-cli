@@ -9,7 +9,6 @@ use crate::workspace::resolve_workspace_root;
 const SERVICE_NAME: &str = "homecmdr";
 const UNIT_PATH: &str = "/etc/systemd/system/homecmdr.service";
 const SYSTEM_BIN: &str = "/usr/local/bin/homecmdr-server";
-const DATA_DIR: &str = "/var/lib/homecmdr";
 
 const SERVICE_UNIT: &str = r#"[Unit]
 Description=HomeCmdr automation server
@@ -39,7 +38,12 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/homecmdr
+# StateDirectory instructs systemd to create /var/lib/homecmdr automatically
+# (with correct ownership) before the process starts.  This also implicitly
+# grants write access under ProtectSystem=strict, so no separate
+# ReadWritePaths= entry is needed.
+StateDirectory=homecmdr
+StateDirectoryMode=0750
 ReadOnlyPaths=/etc/homecmdr
 
 [Install]
@@ -68,6 +72,20 @@ pub fn run() -> Result<()> {
     }
 
     if Path::new(UNIT_PATH).exists() {
+        // Distinguish a complete install from a partial one left behind by an
+        // interrupted previous run.  A missing binary is the clearest sign
+        // that the install never finished.
+        if !Path::new(SYSTEM_BIN).exists() {
+            bail!(
+                "a systemd unit already exists at {} but the server binary is \
+                 missing from {}.\n\
+                 This usually means a previous 'homecmdr service install' was \
+                 interrupted.\n\
+                 Run 'homecmdr service uninstall' to clean up, then re-run \
+                 'homecmdr service install'.",
+                UNIT_PATH, SYSTEM_BIN,
+            );
+        }
         bail!(
             "service unit already exists at {}.\n\
              Run 'homecmdr service uninstall' first if you want to reinstall.",
@@ -95,9 +113,11 @@ pub fn run() -> Result<()> {
     create_system_user()?;
 
     // ── 3. Create directories ─────────────────────────────────────────────
+    // Only the config dir needs to be created here; the data dir
+    // (/var/lib/homecmdr) is managed by systemd via StateDirectory= in the
+    // unit file, so systemd creates and chowns it automatically on first start.
     println!("Step 3/6: Creating system directories...");
-    sudo_run(&["mkdir", "-p", CONFIG_DIR, DATA_DIR])?;
-    sudo_run(&["chown", "homecmdr:homecmdr", DATA_DIR])?;
+    sudo_run(&["mkdir", "-p", CONFIG_DIR])?;
 
     // ── 4. Install config files ───────────────────────────────────────────
     println!("Step 4/6: Installing config and asset files...");
