@@ -15,20 +15,16 @@ pub fn run() -> Result<()> {
     let plugins_dir = workspace.join("config").join("plugins");
 
     // Determine which plugins are installed by scanning config/plugins/ for
-    // .wasm files.  Each <name>.wasm corresponds to an installed plugin.
+    // .plugin.toml manifests.  This covers both WASM and IPC plugin types.
+    // Each <adapter>.plugin.toml corresponds to an installed plugin.
     let installed_adapters: HashSet<String> = if plugins_dir.exists() {
         fs::read_dir(&plugins_dir)
             .with_context(|| format!("failed to read {}", plugins_dir.display()))?
             .filter_map(|entry| entry.ok())
             .filter_map(|entry| {
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("wasm") {
-                    path.file_stem()
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                }
+                let name = path.file_name().and_then(|n| n.to_str())?;
+                name.strip_suffix(".plugin.toml").map(|s| s.to_string())
             })
             .collect()
     } else {
