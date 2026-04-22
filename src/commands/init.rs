@@ -410,12 +410,6 @@ enabled = false
 # ── Adapters ─────────────────────────────────────────────────────────────────
 # Add plugins with: homecmdr plugin add <name>
 # Each plugin installed will append an [adapters.<name>] block here.
-
-[adapters.open_meteo]
-enabled = true
-latitude = {latitude}
-longitude = {longitude}
-poll_interval_secs = 90
 "#,
         bind_address = bind_address,
         master_key = master_key,
