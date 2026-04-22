@@ -230,12 +230,17 @@ fn fetch_latest_tag(repo: &str) -> Result<String> {
         .text()
         .context("failed to read GitHub releases API response")?;
 
-    // Parse the tag_name field — the line looks like: `  "tag_name": "v1.2.3",`
-    // Splitting on '"' yields ["  ", "tag_name", ": ", "v1.2.3", ","]
-    // so the value is always at index 3.
-    body.lines()
-        .find(|l| l.contains("\"tag_name\""))
-        .and_then(|l| l.split('"').nth(3).map(|s| s.to_string()))
+    // Works with both compact and pretty-printed JSON: locate `"tag_name":`
+    // then skip optional whitespace and extract the quoted value.
+    let key = "\"tag_name\":";
+    body.find(key)
+        .and_then(|pos| {
+            let rest = &body[pos + key.len()..];
+            let rest = rest.trim_start_matches([' ', '\n', '\r', '\t']);
+            let rest = rest.strip_prefix('"')?;
+            let end = rest.find('"')?;
+            Some(rest[..end].to_string())
+        })
         .ok_or_else(|| anyhow::anyhow!("could not parse tag_name from GitHub releases response"))
 }
 
