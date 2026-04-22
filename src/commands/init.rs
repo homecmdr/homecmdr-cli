@@ -230,18 +230,12 @@ fn fetch_latest_tag(repo: &str) -> Result<String> {
         .text()
         .context("failed to read GitHub releases API response")?;
 
-    // Parse the tag_name field from the JSON response without pulling in
-    // a full JSON parser — the response shape is stable.
+    // Parse the tag_name field — the line looks like: `  "tag_name": "v1.2.3",`
+    // Splitting on '"' yields ["  ", "tag_name", ": ", "v1.2.3", ","]
+    // so the value is always at index 3.
     body.lines()
         .find(|l| l.contains("\"tag_name\""))
-        .and_then(|l| {
-            let start = l.find('"').map(|i| i + 1)?;
-            let rest = &l[start..];
-            let start2 = rest.find('"').map(|i| i + 1)?;
-            let rest2 = &rest[start2..];
-            let end = rest2.find('"')?;
-            Some(rest2[..end].to_string())
-        })
+        .and_then(|l| l.split('"').nth(3).map(|s| s.to_string()))
         .ok_or_else(|| anyhow::anyhow!("could not parse tag_name from GitHub releases response"))
 }
 
