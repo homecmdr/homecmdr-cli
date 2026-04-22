@@ -54,11 +54,20 @@ pub fn run(name: &str) -> Result<()> {
     remove_config_block(&config_path, &block_name)
         .context("failed to remove plugin config block from config/default.toml")?;
 
-    // If the service is deployed, sync updated config and restart.
+    // If the service is deployed, sync updated config and remove the plugin
+    // files from the system plugin directory so the factory is no longer
+    // loaded on the next start.
     if std::path::Path::new(crate::commands::config_sync::SYSTEM_CONFIG).exists() {
         println!("  Syncing config to system (/etc/homecmdr/default.toml)...");
         crate::commands::config_sync::sync_workspace_config_to_system(&workspace)
             .context("failed to sync config to /etc/homecmdr/default.toml")?;
+
+        let system_plugins_dir = "/etc/homecmdr/plugins";
+        let system_wasm = format!("{}/{}.wasm", system_plugins_dir, adapter);
+        let system_toml = format!("{}/{}.plugin.toml", system_plugins_dir, adapter);
+        println!("  Removing plugin files from {}...", system_plugins_dir);
+        // Ignore errors — files may not be present if they were never synced.
+        let _ = crate::commands::config_sync::sudo_run(&["rm", "-f", &system_wasm, &system_toml]);
     }
 
     println!();

@@ -220,11 +220,38 @@ pub fn run(name: &str) -> Result<()> {
     println!("  Config block written to config/default.toml.");
 
     // If the service is installed, sync the updated workspace config to
-    // /etc/homecmdr/default.toml so the service picks it up on restart.
+    // /etc/homecmdr/default.toml AND copy the new plugin files so the server
+    // can actually find the factory.
     if std::path::Path::new(crate::commands::config_sync::SYSTEM_CONFIG).exists() {
         println!("  Syncing config to system (/etc/homecmdr/default.toml)...");
         crate::commands::config_sync::sync_workspace_config_to_system(&workspace)
             .context("failed to sync config to /etc/homecmdr/default.toml")?;
+
+        // Copy the plugin files into the system plugin directory so the WASM
+        // factory loader can find them on the next (re)start.
+        let system_plugins_dir = "/etc/homecmdr/plugins";
+        let system_wasm = format!("{}/{}.wasm", system_plugins_dir, adapter);
+        let system_toml = format!("{}/{}.plugin.toml", system_plugins_dir, adapter);
+        println!("  Copying plugin files to {}...", system_plugins_dir);
+        crate::commands::config_sync::sudo_run(&[
+            "cp",
+            wasm_dest.to_str().unwrap_or(""),
+            &system_wasm,
+        ])
+        .context("failed to copy .wasm to system plugin directory")?;
+        crate::commands::config_sync::sudo_run(&[
+            "cp",
+            manifest_dest.to_str().unwrap_or(""),
+            &system_toml,
+        ])
+        .context("failed to copy .plugin.toml to system plugin directory")?;
+        crate::commands::config_sync::sudo_run(&[
+            "chown",
+            "homecmdr:homecmdr",
+            &system_wasm,
+            &system_toml,
+        ])
+        .context("failed to set ownership on system plugin files")?;
     }
 
     println!();
